@@ -84,7 +84,7 @@ def main(run_seed: int | None = None):
     # ------------------------
     # 1) Excelをそのまま読み込み（ヘッダ無しで読み込む）
     # ------------------------
-    raw = pd.read_excel(args.excel, sheet_name=args.sheet, header=None, engine="openpyxl")
+    raw = pd.read_excel("data/" + args.excel, sheet_name=args.sheet, header=None, engine="openpyxl")
 
     if raw.shape[0] < 3:
         raise ValueError("行数が足りません（最低でも1行目=項目名, 2行目=項目ID, 3行目以降=データが必要）")
@@ -290,7 +290,7 @@ def main(run_seed: int | None = None):
 
 
     # ---- CatBoost ----
-    cat_file = "result_catboost_100_100.xlsx"
+    cat_file = "result/result_catboost_100_100.xlsx"
 
     if Path(cat_file).exists():
         with pd.ExcelWriter(cat_file, engine="openpyxl", mode="a", if_sheet_exists="new") as writer:
@@ -300,7 +300,7 @@ def main(run_seed: int | None = None):
             cb_imp_df.to_excel(writer, sheet_name=timestamp, index=False)
 
     # ---- LightGBM ----
-    lgb_file = "result_lightgbm_100_100.xlsx"
+    lgb_file = "result/result_lightgbm_100_100.xlsx"
 
     if Path(lgb_file).exists():
         with pd.ExcelWriter(lgb_file, engine="openpyxl", mode="a", if_sheet_exists="new") as writer:

@@ -68,7 +68,8 @@ def to_contrib_df(features: list[str], importances: np.ndarray) -> pd.DataFrame:
 
 def main(run_seed: int | None = None):
     parser = argparse.ArgumentParser()
-    parser.add_argument("--excel", required=True, help="Excelファイルパス (.xlsx)")
+    parser.add_argument("--data", required=True, help="Excelファイルパス (.xlsx)")
+    parser.add_argument("--result", required=True, help="結果を保存するExcelファイル名")
     parser.add_argument("--sheet", default=0, help="シート名またはインデックス（既定: 0）")
     parser.add_argument("--n_splits", type=int, default=5, help="CV分割数（既定: 5）")
     parser.add_argument("--seed", type=int, default=42, help="乱数シード（既定: 42）")
@@ -84,7 +85,7 @@ def main(run_seed: int | None = None):
     # ------------------------
     # 1) Excelをそのまま読み込み（ヘッダ無しで読み込む）
     # ------------------------
-    raw = pd.read_excel("data/" + args.excel, sheet_name=args.sheet, header=None, engine="openpyxl")
+    raw = pd.read_excel("data/" + args.data, sheet_name=args.sheet, header=None, engine="openpyxl")
 
     if raw.shape[0] < 3:
         raise ValueError("行数が足りません（最低でも1行目=項目名, 2行目=項目ID, 3行目以降=データが必要）")
@@ -252,7 +253,8 @@ def main(run_seed: int | None = None):
         # print(f"\n== {name} ==")
         # print(f"RMSE mean={np.mean(rmses):.5f}, std={np.std(rmses):.5f}")
         # print(f"MAE  mean={np.mean(maes):.5f}, std={np.std(maes):.5f}")
-        print(f"{name} {np.mean(rmses):.5f} {np.std(rmses):.5f} {np.mean(maes):.5f} {np.std(maes):.5f}",end="")
+        # print(f"{name} {np.mean(rmses):.5f} {np.std(rmses):.5f} {np.mean(maes):.5f} {np.std(maes):.5f}",end="")
+        print(f"{name} {np.mean(rmses):.5f} {np.mean(maes):.5f}",end="")
 
     timestamp = datetime.now().strftime("%m%d%H%M%S")
     timestamp_console=datetime.now().strftime("%m/%d %H:%M:%S")
@@ -290,7 +292,7 @@ def main(run_seed: int | None = None):
 
 
     # ---- CatBoost ----
-    cat_file = "result/result_catboost_100_100.xlsx"
+    cat_file = "result/result_catboost_"+args.result+".xlsx"
 
     if Path(cat_file).exists():
         with pd.ExcelWriter(cat_file, engine="openpyxl", mode="a", if_sheet_exists="new") as writer:
@@ -300,7 +302,7 @@ def main(run_seed: int | None = None):
             cb_imp_df.to_excel(writer, sheet_name=timestamp, index=False)
 
     # ---- LightGBM ----
-    lgb_file = "result/result_lightgbm_100_100.xlsx"
+    lgb_file = "result/result_lightgbm_"+args.result+".xlsx"
 
     if Path(lgb_file).exists():
         with pd.ExcelWriter(lgb_file, engine="openpyxl", mode="a", if_sheet_exists="new") as writer:
@@ -314,5 +316,9 @@ def main(run_seed: int | None = None):
     # print(f"  - {lgb_file} (sheet: {timestamp})")
 
 if __name__ == "__main__":
+    timestamp_console=datetime.now().strftime("%m/%d %H:%M:%S")
+    print(timestamp_console+" start")
+    print()
+    print("     timestamp  CB_RMSE   CB_MAE  LG_RMSE   LG_MAE")
     for count in range(100):
         main(run_seed=42 + count)

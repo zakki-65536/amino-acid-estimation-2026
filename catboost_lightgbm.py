@@ -1,4 +1,6 @@
-# compare_catboost_lightgbm_by_id.py
+# pip install pandas openpyxl scikit-learn catboost lightgbm
+# python catboost_lightgbm.py --data data_204項目_male_空腹時.xlsx --result male_空腹時
+
 # ------------------------------------------------------------
 # Excelをpandasで読み込み：
 # - 1行目: 項目名（先頭 c=カテゴリ, n=数値）
@@ -9,8 +11,6 @@
 # CatBoost と LightGBM を同一のKFoldで比較（RMSE/MAE）
 # + 全フォールド平均の特徴量重要度（寄与率%）を出力（CSV保存も）
 #
-# 必要:
-#   pip install pandas openpyxl scikit-learn catboost lightgbm
 # ------------------------------------------------------------
 
 from __future__ import annotations

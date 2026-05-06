@@ -36,6 +36,15 @@ def rmse(y_true, y_pred) -> float:
 def mae(y_true, y_pred) -> float:
     return float(mean_absolute_error(y_true, y_pred))
 
+def tolerance_accuracy(y_true, y_pred, tolerance_ratio: float = 0.05) -> float:
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+
+    abs_error = np.abs(y_pred - y_true)
+    tolerance = np.abs(y_true) * tolerance_ratio
+    correct = abs_error <= tolerance
+
+    return float(np.mean(correct))
 
 def make_unique_names(names: list[str]) -> list[str]:
     """重複列名があると学習で事故るので、重複時は _2, _3... を付与してユニーク化"""
@@ -185,6 +194,10 @@ def main(run_seed: int | None = None):
     cb_importances = []
     lgb_importances = []
 
+    # 正解率計算用に全foldの予測と真値を保持
+    cb_all_true_list, cb_all_pred_list = [], []
+    lgb_all_true_list, lgb_all_pred_list = [], []
+
     for fold, (tr_idx, va_idx) in enumerate(kf.split(X_cb), start=1):
         X_tr_cb, X_va_cb = X_cb.iloc[tr_idx], X_cb.iloc[va_idx]
         X_tr_lgb, X_va_lgb = X_lgb.iloc[tr_idx], X_lgb.iloc[va_idx]
@@ -213,6 +226,10 @@ def main(run_seed: int | None = None):
         cb_rmses.append(rmse(y_va, pred_cb))
         cb_maes.append(mae(y_va, pred_cb))
 
+        # ★追加：正解率用に保存
+        cb_all_true_list.append(y_va.to_numpy())
+        cb_all_pred_list.append(np.asarray(pred_cb))
+
         # ★追加：CatBoostの特徴量重要度（LossFunctionChange系のデフォルト）
         cb_importances.append(cb.get_feature_importance())
 
@@ -238,6 +255,10 @@ def main(run_seed: int | None = None):
         lgb_rmses.append(rmse(y_va, pred_lgb))
         lgb_maes.append(mae(y_va, pred_lgb))
 
+        # ★追加：正解率用に保存
+        lgb_all_true_list.append(y_va.to_numpy())
+        lgb_all_pred_list.append(np.asarray(pred_lgb))
+
         # ★追加：LightGBMの特徴量重要度（gain）
         lgb_importances.append(lgbm.booster_.feature_importance(importance_type="gain"))
 
@@ -249,18 +270,29 @@ def main(run_seed: int | None = None):
         )
         """
 
-    def summarize(name: str, rmses: list[float], maes: list[float]) -> None:
+    # ★追加：全foldをまとめて正解率計算
+    cb_all_true = np.concatenate(cb_all_true_list)
+    cb_all_pred = np.concatenate(cb_all_pred_list)
+    lgb_all_true = np.concatenate(lgb_all_true_list)
+    lgb_all_pred = np.concatenate(lgb_all_pred_list)
+
+    cb_acc = tolerance_accuracy(cb_all_true, cb_all_pred, tolerance_ratio=0.05)
+    lgb_acc = tolerance_accuracy(lgb_all_true, lgb_all_pred, tolerance_ratio=0.05)
+
+    def summarize(name: str, rmses: list[float], maes: list[float], acc: float) -> None:
         # print(f"\n== {name} ==")
         # print(f"RMSE mean={np.mean(rmses):.5f}, std={np.std(rmses):.5f}")
         # print(f"MAE  mean={np.mean(maes):.5f}, std={np.std(maes):.5f}")
         # print(f"{name} {np.mean(rmses):.5f} {np.std(rmses):.5f} {np.mean(maes):.5f} {np.std(maes):.5f}",end="")
-        print(f"{name} {np.mean(rmses):.5f} {np.mean(maes):.5f}",end="")
+        # print(f"{name} {np.mean(rmses):.5f} {np.mean(maes):.5f}",end="")
+        print(f"{name} {np.mean(rmses):.5f} {np.mean(maes):.5f} {acc:.5f}", end="")
 
     timestamp = datetime.now().strftime("%m%d%H%M%S")
     timestamp_console=datetime.now().strftime("%m/%d %H:%M:%S")
 
-    summarize(timestamp_console, cb_rmses, cb_maes)
-    summarize("", lgb_rmses, lgb_maes)
+    summarize(timestamp_console, cb_rmses, cb_maes, cb_acc)
+    print(" ", end="")
+    summarize("", lgb_rmses, lgb_maes, lgb_acc)
     print()
 
     # print("\n== Difference (LightGBM - CatBoost) ==")
@@ -319,6 +351,6 @@ if __name__ == "__main__":
     timestamp_console=datetime.now().strftime("%m/%d %H:%M:%S")
     print(timestamp_console+" start")
     print()
-    print("     timestamp  CB_RMSE   CB_MAE  LG_RMSE   LG_MAE")
+    print("     timestamp  CB_RMSE   CB_MAE  CB_ACC   LG_RMSE   LG_MAE  LG_ACC")
     for count in range(100):
         main(run_seed=42 + count)

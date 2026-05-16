@@ -278,6 +278,11 @@ def run_experiment(
     lgb_all_true = np.concatenate(lgb_all_true_list)
     lgb_all_pred = np.concatenate(lgb_all_pred_list)
 
+    cb_mae_all = mae(cb_all_true, cb_all_pred)
+    lgb_mae_all = mae(lgb_all_true, lgb_all_pred)
+    cb_rmse_all = rmse(cb_all_true, cb_all_pred)
+    lgb_rmse_all = rmse(lgb_all_true, lgb_all_pred)
+
     cb_acc = tolerance_accuracy(cb_all_true, cb_all_pred, tolerance_ratio=0.05)
     lgb_acc = tolerance_accuracy(
         lgb_all_true, lgb_all_pred, tolerance_ratio=0.05)
@@ -287,14 +292,14 @@ def run_experiment(
 
     if (acc):
         print(
-            f"{timestamp_console}   {np.mean(cb_rmses):.2f}  {np.mean(cb_maes):.2f} {cb_acc:.4f} ", end="")
+            f"{timestamp_console} {run_no:4d}   {cb_rmse_all:.2f}  {cb_mae_all:.2f} {cb_acc:.4f} ", end="")
         print(
-            f"  {np.mean(lgb_rmses):.2f}  {np.mean(lgb_maes):.2f} {lgb_acc:.4f}", end="")
+            f"  {lgb_rmse_all:.2f}  {lgb_mae_all:.2f} {lgb_acc:.4f}", end="")
     else:
         print(
-            f"{timestamp_console}   {np.mean(cb_rmses):.2f}  {np.mean(cb_maes):.2f} ", end="")
+            f"{timestamp_console} {run_no:4d}   {cb_rmse_all:.2f}  {cb_mae_all:.2f} ", end="")
         print(
-            f"  {np.mean(lgb_rmses):.2f}  {np.mean(lgb_maes):.2f}", end="")
+            f"  {lgb_rmse_all:.2f}  {lgb_mae_all:.2f}", end="")
     print()
 
     # print("\n== Difference (LightGBM - CatBoost) ==")
@@ -344,19 +349,15 @@ def run_experiment(
         with pd.ExcelWriter(lgb_file, engine="openpyxl") as writer:
             lgb_imp_df.to_excel(writer, sheet_name=timestamp, index=False)
 
-    # print("\n[Saved to Excel]")
-    # print(f"  - {cat_file} (sheet: {timestamp})")
-    # print(f"  - {lgb_file} (sheet: {timestamp})")
-
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--acc", action="store_true")
-    parser.add_argument("--data", required=True, help="Excelファイルパス (.xlsx)")
+    parser.add_argument("--acc", action="store_true", help="正解率表示")
+    parser.add_argument("--data", required=True, help="Excelファイルパス")
     parser.add_argument("--result", required=True, help="結果を保存するExcelファイル名")
-    parser.add_argument("--sheet", default=0, help="シート名またはインデックス（既定: 0）")
-    parser.add_argument("--n_splits", type=int, default=5, help="CV分割数（既定: 5）")
-    parser.add_argument("--seed", type=int, default=42, help="乱数シード（既定: 42）")
+    parser.add_argument("--sheet", default=0, help="シート名")
+    parser.add_argument("--n_splits", type=int, default=5, help="CV分割数")
+    parser.add_argument("--seed", type=int, default=42, help="乱数シード")
     args = parser.parse_args()
 
     timestamp_console = datetime.now().strftime("%m/%d %H:%M:%S")
@@ -364,9 +365,9 @@ def main():
     print()
 
     if (args.acc):
-        print("     timestamp CB_RMSE CB_MAE CB_ACC LG_RMSE LG_MAE LG_ACC")
+        print("     timestamp   no CB_RMSE CB_MAE CB_ACC LG_RMSE LG_MAE LG_ACC")
     else:
-        print("     timestamp CB_RMSE CB_MAE LG_RMSE LG_MAE")
+        print("     timestamp   no CB_RMSE CB_MAE LG_RMSE LG_MAE")
     for count in range(100):
         run_experiment(run_seed=42 + count, acc=args.acc, run_no=count +
                        1, data=args.data, result=args.result)

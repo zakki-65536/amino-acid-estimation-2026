@@ -36,6 +36,7 @@ def rmse(y_true, y_pred) -> float:
 def mae(y_true, y_pred) -> float:
     return float(mean_absolute_error(y_true, y_pred))
 
+
 def tolerance_accuracy(y_true, y_pred, tolerance_ratio: float = 0.05) -> float:
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -45,6 +46,7 @@ def tolerance_accuracy(y_true, y_pred, tolerance_ratio: float = 0.05) -> float:
     correct = abs_error <= tolerance
 
     return float(np.mean(correct))
+
 
 def make_unique_names(names: list[str]) -> list[str]:
     """重複列名があると学習で事故るので、重複時は _2, _3... を付与してユニーク化"""
@@ -70,31 +72,26 @@ def to_contrib_df(features: list[str], importances: np.ndarray) -> pd.DataFrame:
     else:
         contrib = imp / total * 100.0
 
-    df = pd.DataFrame({"Feature": features, "Importance": imp, "Contribution(%)": contrib})
+    df = pd.DataFrame(
+        {"Feature": features, "Importance": imp, "Contribution(%)": contrib})
     df = df.sort_values("Importance", ascending=False).reset_index(drop=True)
     return df
 
 
-def main(run_seed: int | None = None):
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--data", required=True, help="Excelファイルパス (.xlsx)")
-    parser.add_argument("--result", required=True, help="結果を保存するExcelファイル名")
-    parser.add_argument("--sheet", default=0, help="シート名またはインデックス（既定: 0）")
-    parser.add_argument("--n_splits", type=int, default=5, help="CV分割数（既定: 5）")
-    parser.add_argument("--seed", type=int, default=42, help="乱数シード（既定: 42）")
-    parser.add_argument("--top_k", type=int, default=30, help="重要度上位の表示件数（既定: 30）")
-    args = parser.parse_args()
-
-    if run_seed is None:
-        run_seed = args.seed
-
-    # runごとに乱数を変える
-    rng = np.random.default_rng(run_seed)
+def run_experiment(
+    run_seed: int = 42,
+    acc: bool = False,
+    run_no: int = 1,
+    data: str = "",
+    result: str = "",
+    n_splits: int = 5,
+    sheet=0,
+):
 
     # ------------------------
     # 1) Excelをそのまま読み込み（ヘッダ無しで読み込む）
     # ------------------------
-    raw = pd.read_excel(args.data, sheet_name=args.sheet, header=None, engine="openpyxl")
+    raw = pd.read_excel(data, sheet_name=sheet, header=None, engine="openpyxl")
 
     if raw.shape[0] < 3:
         raise ValueError("行数が足りません（最低でも1行目=項目名, 2行目=項目ID, 3行目以降=データが必要）")
@@ -123,10 +120,13 @@ def main(run_seed: int | None = None):
     # ------------------------
     name_by_id = dict(zip(col_ids, item_names))
 
-    cat_cols = [cid for cid in feature_cols if name_by_id.get(cid, "").strip().lower().startswith("c")]
-    num_cols = [cid for cid in feature_cols if name_by_id.get(cid, "").strip().lower().startswith("n")]
+    cat_cols = [cid for cid in feature_cols if name_by_id.get(
+        cid, "").strip().lower().startswith("c")]
+    num_cols = [cid for cid in feature_cols if name_by_id.get(
+        cid, "").strip().lower().startswith("n")]
 
-    other_cols = [cid for cid in feature_cols if cid not in cat_cols and cid not in num_cols]
+    other_cols = [
+        cid for cid in feature_cols if cid not in cat_cols and cid not in num_cols]
     if other_cols:
         print(
             f"[WARN] 項目名が c/n で始まらない列が {len(other_cols)} 個あります。"
@@ -155,7 +155,8 @@ def main(run_seed: int | None = None):
     # LightGBM用：カテゴリ列は category dtype
     X_lgb = X.copy()
     for c in cat_cols:
-        X_lgb[c] = X_lgb[c].where(~X_lgb[c].isna(), "missing").astype(str).astype("category")
+        X_lgb[c] = X_lgb[c].where(~X_lgb[c].isna(), "missing").astype(
+            str).astype("category")
 
     # CatBoostのcat_featuresは「列インデックス」
     cat_feature_indices = [X_cb.columns.get_loc(c) for c in cat_cols]
@@ -181,11 +182,11 @@ def main(run_seed: int | None = None):
     # ------------------------
     # 4) CVで比較（同一分割）
     # ------------------------
-    
+
     # kf = KFold(n_splits=args.n_splits, shuffle=True, random_state=args.seed)
-    
+
     # KFoldもrunごとに変える（ここが重要）
-    kf = KFold(n_splits=args.n_splits, shuffle=True, random_state=run_seed)
+    kf = KFold(n_splits=n_splits, shuffle=True, random_state=run_seed)
 
     cb_rmses, cb_maes = [], []
     lgb_rmses, lgb_maes = [], []
@@ -242,7 +243,7 @@ def main(run_seed: int | None = None):
             colsample_bytree=0.8,  # 列方向サンプリング 毎回80%の特徴量で木を作る
             random_state=run_seed,
             n_jobs=-1,
-            verbosity=-1, # ログ非表示
+            verbosity=-1,  # ログ非表示
         )
         lgbm.fit(
             X_tr_lgb, y_tr,
@@ -260,7 +261,8 @@ def main(run_seed: int | None = None):
         lgb_all_pred_list.append(np.asarray(pred_lgb))
 
         # ★追加：LightGBMの特徴量重要度（gain）
-        lgb_importances.append(lgbm.booster_.feature_importance(importance_type="gain"))
+        lgb_importances.append(
+            lgbm.booster_.feature_importance(importance_type="gain"))
 
         """
         print(
@@ -277,22 +279,22 @@ def main(run_seed: int | None = None):
     lgb_all_pred = np.concatenate(lgb_all_pred_list)
 
     cb_acc = tolerance_accuracy(cb_all_true, cb_all_pred, tolerance_ratio=0.05)
-    lgb_acc = tolerance_accuracy(lgb_all_true, lgb_all_pred, tolerance_ratio=0.05)
-
-    def summarize(name: str, rmses: list[float], maes: list[float], acc: float) -> None:
-        # print(f"\n== {name} ==")
-        # print(f"RMSE mean={np.mean(rmses):.5f}, std={np.std(rmses):.5f}")
-        # print(f"MAE  mean={np.mean(maes):.5f}, std={np.std(maes):.5f}")
-        # print(f"{name} {np.mean(rmses):.5f} {np.std(rmses):.5f} {np.mean(maes):.5f} {np.std(maes):.5f}",end="")
-        # print(f"{name} {np.mean(rmses):.5f} {np.mean(maes):.5f}",end="")
-        print(f"{name} {np.mean(rmses):.5f} {np.mean(maes):.5f} {acc:.5f}", end="")
+    lgb_acc = tolerance_accuracy(
+        lgb_all_true, lgb_all_pred, tolerance_ratio=0.05)
 
     timestamp = datetime.now().strftime("%m%d%H%M%S")
-    timestamp_console=datetime.now().strftime("%m/%d %H:%M:%S")
+    timestamp_console = datetime.now().strftime("%m/%d %H:%M:%S")
 
-    summarize(timestamp_console, cb_rmses, cb_maes, cb_acc)
-    print(" ", end="")
-    summarize("", lgb_rmses, lgb_maes, lgb_acc)
+    if (acc):
+        print(
+            f"{timestamp_console}   {np.mean(cb_rmses):.2f}  {np.mean(cb_maes):.2f} {cb_acc:.4f} ", end="")
+        print(
+            f"  {np.mean(lgb_rmses):.2f}  {np.mean(lgb_maes):.2f} {lgb_acc:.4f}", end="")
+    else:
+        print(
+            f"{timestamp_console}   {np.mean(cb_rmses):.2f}  {np.mean(cb_maes):.2f} ", end="")
+        print(
+            f"  {np.mean(lgb_rmses):.2f}  {np.mean(lgb_maes):.2f}", end="")
     print()
 
     # print("\n== Difference (LightGBM - CatBoost) ==")
@@ -322,9 +324,8 @@ def main(run_seed: int | None = None):
     # Excel保存（シート追加）
     # ------------------------
 
-
     # ---- CatBoost ----
-    cat_file = "result/result_catboost_"+args.result+"_100.xlsx"
+    cat_file = "result/result_catboost_"+result+"_100.xlsx"
 
     if Path(cat_file).exists():
         with pd.ExcelWriter(cat_file, engine="openpyxl", mode="a", if_sheet_exists="new") as writer:
@@ -334,7 +335,7 @@ def main(run_seed: int | None = None):
             cb_imp_df.to_excel(writer, sheet_name=timestamp, index=False)
 
     # ---- LightGBM ----
-    lgb_file = "result/result_lightgbm_"+args.result+"_100.xlsx"
+    lgb_file = "result/result_lightgbm_"+result+"_100.xlsx"
 
     if Path(lgb_file).exists():
         with pd.ExcelWriter(lgb_file, engine="openpyxl", mode="a", if_sheet_exists="new") as writer:
@@ -347,10 +348,29 @@ def main(run_seed: int | None = None):
     # print(f"  - {cat_file} (sheet: {timestamp})")
     # print(f"  - {lgb_file} (sheet: {timestamp})")
 
-if __name__ == "__main__":
-    timestamp_console=datetime.now().strftime("%m/%d %H:%M:%S")
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--acc", action="store_true")
+    parser.add_argument("--data", required=True, help="Excelファイルパス (.xlsx)")
+    parser.add_argument("--result", required=True, help="結果を保存するExcelファイル名")
+    parser.add_argument("--sheet", default=0, help="シート名またはインデックス（既定: 0）")
+    parser.add_argument("--n_splits", type=int, default=5, help="CV分割数（既定: 5）")
+    parser.add_argument("--seed", type=int, default=42, help="乱数シード（既定: 42）")
+    args = parser.parse_args()
+
+    timestamp_console = datetime.now().strftime("%m/%d %H:%M:%S")
     print(timestamp_console+" start")
     print()
-    print("     timestamp  CB_RMSE   CB_MAE  CB_ACC   LG_RMSE   LG_MAE  LG_ACC")
+
+    if (args.acc):
+        print("     timestamp CB_RMSE CB_MAE CB_ACC LG_RMSE LG_MAE LG_ACC")
+    else:
+        print("     timestamp CB_RMSE CB_MAE LG_RMSE LG_MAE")
     for count in range(100):
-        main(run_seed=42 + count)
+        run_experiment(run_seed=42 + count, acc=args.acc, run_no=count +
+                       1, data=args.data, result=args.result)
+
+
+if __name__ == "__main__":
+    main()

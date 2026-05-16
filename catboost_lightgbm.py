@@ -84,6 +84,7 @@ def build_importance_pivot_df(imp_df_list):
         f"run_{col}" for col in pivot_df.columns
     ]
     pivot_df = pivot_df.reset_index()
+    pivot_df["Feature"] = pd.to_numeric(pivot_df["Feature"])
     return pivot_df
 
 
@@ -256,7 +257,6 @@ def main():
     data_file = args.data
     result_file = args.result
 
-    print(filename)
     timestamp = datetime.now().strftime("%m/%d %H:%M:%S")
     print(timestamp+" start")
     print()

@@ -1,32 +1,23 @@
 # pip install pandas openpyxl scikit-learn catboost lightgbm
-# python catboost_lightgbm.py --data data_204項目_male_空腹時.xlsx --result male_空腹時
-
-# ------------------------------------------------------------
-# Excelをpandasで読み込み：
-# - 1行目: 項目名（先頭 c=カテゴリ, n=数値）
-# - 2行目: 項目ID（学習時の列名として使用）
-# - 3行目以降: データ
-# - 最終列が目的変数（回帰）
+# python catboost_lightgbm.py --data data_204項目_male_空腹時.xlsx
 #
-# CatBoost と LightGBM を同一のKFoldで比較（RMSE/MAE）
-# + 全フォールド平均の特徴量重要度（寄与率%）を出力（CSV保存も）
-#
-# ------------------------------------------------------------
+# 「--(項目名) (値)」を追加することで、以下の値を指定できます。
+# --data: データのExcelファイルパス (必須)
+# --result: 結果保存用Excelファイルパス (任意 デフォルトは日付と時刻)
+# --n_splits: k分割交差検証のkの値 (任意 デフォルトは5)
+# --seed: 乱数シード (任意: デフォルトは42)
+# --ratio: 正解率 (任意: デフォルトは0.05)
+# --num_exec: k分割交差検証の回数 (任意: デフォルトは10)
 
 from __future__ import annotations
-
 import argparse
 import numpy as np
 import pandas as pd
-
 from sklearn.model_selection import KFold
 from sklearn.metrics import mean_squared_error, mean_absolute_error
-
 from catboost import CatBoostRegressor
 import lightgbm as lgb
-
 from datetime import datetime
-from pathlib import Path
 
 
 def rmse(y_true, y_pred) -> float:
@@ -255,7 +246,7 @@ def main():
     filename = "result/result_" + datetime.now().strftime("%Y%m%dT%H%M%S")+".xlsx"
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data", required=True, help="Excelファイルパス")
+    parser.add_argument("--data", required=True, help="データのExcelファイルパス")
     parser.add_argument("--result", default=filename, help="結果保存用Excelファイルパス")
     parser.add_argument("--n_splits", type=int, default=5, help="k分割交差検証のkの値")
     parser.add_argument("--seed", type=int, default=42, help="乱数シード")

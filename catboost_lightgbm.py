@@ -48,170 +48,131 @@ def tolerance_accuracy(y_true, y_pred, tolerance_ratio: float = 0.05) -> float:
     return float(np.mean(correct))
 
 
-def make_unique_names(names: list[str]) -> list[str]:
-    """重複列名があると学習で事故るので、重複時は _2, _3... を付与してユニーク化"""
-    seen = {}
-    out = []
-    for n in names:
-        n = str(n)
-        if n not in seen:
-            seen[n] = 1
-            out.append(n)
-        else:
-            seen[n] += 1
-            out.append(f"{n}_{seen[n]}")
-    return out
+# 重要度のDataFrameを生成
+def build_importance_df(
+    features: list[str],
+    importances_list: list[np.ndarray],
+    item_map_df: pd.DataFrame,
+    run_no: int,
+):
+    mean_importance = np.mean(
+        np.asarray(importances_list, dtype=float),
+        axis=0,
+    )
+    total = float(np.sum(mean_importance))
+    contribution = mean_importance / total * 100.0
+    imp_df = pd.DataFrame({
+        "run_no": run_no,
+        "Feature": pd.Series(features, dtype="str"),
+        "Contribution": contribution,
+    })
+    imp_df = imp_df.merge(
+        item_map_df,
+        on="Feature",
+        how="left",
+    )
+    imp_df = imp_df[
+        ["run_no", "Feature", "name", "Contribution"]
+    ]
+    return imp_df
 
 
-def to_contrib_df(features: list[str], importances: np.ndarray) -> pd.DataFrame:
-    """重要度から寄与率(%)を作ってDataFrame化（合計が0のときは0%）"""
-    imp = np.asarray(importances, dtype=float)
-    total = float(np.sum(imp))
-    if total == 0.0 or np.isnan(total):
-        contrib = np.zeros_like(imp)
-    else:
-        contrib = imp / total * 100.0
+# 重要度のDataFrameを結合
+def build_importance_pivot_df(imp_df_list):
+    all_imp_df = pd.concat(
+        imp_df_list,
+        axis=0,
+        ignore_index=True,
+    )
+    pivot_df = all_imp_df.pivot(
+        index=["Feature", "name"],
+        columns="run_no",
+        values="Contribution",
+    )
+    pivot_df.columns = [
+        f"run_{col}" for col in pivot_df.columns
+    ]
+    pivot_df = pivot_df.reset_index()
+    return pivot_df
 
-    df = pd.DataFrame(
-        {"Feature": features, "Importance": imp, "Contribution(%)": contrib})
-    df = df.sort_values("Importance", ascending=False).reset_index(drop=True)
-    return df
 
-
+# 予測を実行
 def run_experiment(
     run_seed: int = 42,
-    acc: bool = False,
     run_no: int = 1,
-    data: str = "",
-    result: str = "",
+    data_file: str = "",
     n_splits: int = 5,
-    sheet=0,
+    tolerance_ratio: float = 0.05
 ):
+    raw = pd.read_excel(data_file, header=None, engine="openpyxl")
 
-    # ------------------------
-    # 1) Excelをそのまま読み込み（ヘッダ無しで読み込む）
-    # ------------------------
-    raw = pd.read_excel(data, sheet_name=sheet, header=None, engine="openpyxl")
-
-    if raw.shape[0] < 3:
-        raise ValueError("行数が足りません（最低でも1行目=項目名, 2行目=項目ID, 3行目以降=データが必要）")
-    if raw.shape[1] < 2:
-        raise ValueError("列数が足りません（説明変数＋目的変数が必要）")
-
-    # 1行目（index=0）: 項目名  / 2行目（index=1）: 項目ID
+    # 1行目の項目名、2行目の項目IDを取得
     item_names = raw.iloc[0, :].astype(str).tolist()
     item_ids = raw.iloc[1, :].tolist()
-
-    # 列名（学習用）は項目IDを使用（数字でもOKだが、扱いを安定させるため文字列化）
+    item_map_df = pd.DataFrame({
+        "Feature": item_ids,
+        "name": item_names,
+    })
+    item_map_df["Feature"] = item_map_df["Feature"].astype(str)
     col_ids = [str(x) for x in item_ids]
-    col_ids = make_unique_names(col_ids)  # 念のため重複回避
 
-    # 3行目以降がデータ
+    # 3行目以降のデータを取得
     df = raw.iloc[2:, :].copy()
     df.columns = col_ids
     df.reset_index(drop=True, inplace=True)
 
-    # 最終列が目的変数
+    # 最終列の目的変数を取得
     target_col = df.columns[-1]
     feature_cols = list(df.columns[:-1])
 
-    # ------------------------
-    # 2) c/n 判定は「項目名（1行目）」で行い、列名は「項目ID」で扱う
-    # ------------------------
+    # 項目が数値かカテゴリかを判定
     name_by_id = dict(zip(col_ids, item_names))
-
     cat_cols = [cid for cid in feature_cols if name_by_id.get(
         cid, "").strip().lower().startswith("c")]
     num_cols = [cid for cid in feature_cols if name_by_id.get(
         cid, "").strip().lower().startswith("n")]
-
     other_cols = [
         cid for cid in feature_cols if cid not in cat_cols and cid not in num_cols]
     if other_cols:
-        print(
-            f"[WARN] 項目名が c/n で始まらない列が {len(other_cols)} 個あります。"
-            f"数値扱いに寄せます（ID）: {other_cols[:10]}"
-        )
+        print("項目名が c/n で始まらない列があります。")
         num_cols += other_cols
 
-    # ------------------------
-    # 3) 目的変数を数値化
-    # ------------------------
-    y = pd.to_numeric(df[target_col], errors="coerce")
-
-    # 説明変数
+    # 説明変数と目的変数を指定
     X = df[feature_cols].copy()
-
-    # 数値列を数値化（変換不可はNaN）
+    y = pd.to_numeric(df[target_col], errors="coerce")
     for c in num_cols:
         X[c] = pd.to_numeric(X[c], errors="coerce")
 
-    # CatBoost用：カテゴリ列は「必ず文字列」に（実数が混ざってもOKにするため）
+    # カテゴリ列を文字列に変換
     X_cb = X.copy()
     for c in cat_cols:
         X_cb[c] = X_cb[c].where(~X_cb[c].isna(), "missing")
         X_cb[c] = X_cb[c].astype(str)
-
-    # LightGBM用：カテゴリ列は category dtype
+    cat_feature_indices = [X_cb.columns.get_loc(c) for c in cat_cols]
     X_lgb = X.copy()
     for c in cat_cols:
         X_lgb[c] = X_lgb[c].where(~X_lgb[c].isna(), "missing").astype(
             str).astype("category")
 
-    # CatBoostのcat_featuresは「列インデックス」
-    cat_feature_indices = [X_cb.columns.get_loc(c) for c in cat_cols]
-
-    '''
-    print("---- Data Summary ----")
-    print(f"Rows (data): {len(df)}")
-    print(f"Features: {len(feature_cols)}")
-    print(f"  Numeric: {len(num_cols)}")
-    print(f"  Categorical: {len(cat_cols)}")
-    print(f"Target (last col ID): {target_col}")
-    print("----------------------")
-    '''
-
-    # 欠損のある目的変数行は落とす（学習不能なので）
-    valid_idx = y.notna()
-    if valid_idx.sum() != len(y):
-        print(f"[WARN] 目的変数がNaNの行を除外します: {len(y) - valid_idx.sum()} 行")
-        y = y[valid_idx].reset_index(drop=True)
-        X_cb = X_cb.loc[valid_idx].reset_index(drop=True)
-        X_lgb = X_lgb.loc[valid_idx].reset_index(drop=True)
-
-    # ------------------------
-    # 4) CVで比較（同一分割）
-    # ------------------------
-
-    # kf = KFold(n_splits=args.n_splits, shuffle=True, random_state=args.seed)
-
-    # KFoldもrunごとに変える（ここが重要）
     kf = KFold(n_splits=n_splits, shuffle=True, random_state=run_seed)
+    cb_importances, lgb_importances = [], []
+    all_true_list, cb_all_pred_list, lgb_all_pred_list = [], [], []
 
-    cb_rmses, cb_maes = [], []
-    lgb_rmses, lgb_maes = [], []
-
-    # ★追加：全フォールド重要度を保存
-    cb_importances = []
-    lgb_importances = []
-
-    # 正解率計算用に全foldの予測と真値を保持
-    cb_all_true_list, cb_all_pred_list = [], []
-    lgb_all_true_list, lgb_all_pred_list = [], []
-
+    # k分割交差検証開始
     for fold, (tr_idx, va_idx) in enumerate(kf.split(X_cb), start=1):
         X_tr_cb, X_va_cb = X_cb.iloc[tr_idx], X_cb.iloc[va_idx]
         X_tr_lgb, X_va_lgb = X_lgb.iloc[tr_idx], X_lgb.iloc[va_idx]
         y_tr, y_va = y.iloc[tr_idx], y.iloc[va_idx]
+        all_true_list.append(y_va.to_numpy())
 
-        # ---- CatBoost ----
+        # CatBoost実行
         cb = CatBoostRegressor(
             loss_function="RMSE",  # 学習時に最小化する目的関数
-            eval_metric="RMSE",  # 検証データで見る指標 early stoppingの基準
+            eval_metric="RMSE",  # 検証データで見る指標
             iterations=10000,  # 最大ツリー数(ブースティング回数)
-            learning_rate=0.03,  # 1本の木がどれだけ強く補正するか 0.03はやや学習が遅め
-            depth=6,  # 1本の木の深さの最大 深いほど過学習しやすい
-            l2_leaf_reg=10,  # L2正則化（過学習抑制）
+            learning_rate=0.03,  # 1本の木がどれだけ強く補正するか
+            depth=6,  # 1本の木の深さの最大(深いほど過学習しやすい)
+            l2_leaf_reg=10,  # L2正則化(過学習抑制)
             random_seed=run_seed,
             allow_writing_files=False,
             verbose=False,
@@ -220,157 +181,139 @@ def run_experiment(
             X_tr_cb, y_tr,
             cat_features=cat_feature_indices,
             eval_set=(X_va_cb, y_va),
-            early_stopping_rounds=200,  # 200回連続で改善しなければ停止 過学習防止
-            use_best_model=True,  # 最良のiterationまで戻す
+            early_stopping_rounds=200,  # この回数連続で改善しなければ停止
+            use_best_model=True,
         )
         pred_cb = cb.predict(X_va_cb)
-        cb_rmses.append(rmse(y_va, pred_cb))
-        cb_maes.append(mae(y_va, pred_cb))
-
-        # ★追加：正解率用に保存
-        cb_all_true_list.append(y_va.to_numpy())
         cb_all_pred_list.append(np.asarray(pred_cb))
-
-        # ★追加：CatBoostの特徴量重要度（LossFunctionChange系のデフォルト）
         cb_importances.append(cb.get_feature_importance())
 
-        # ---- LightGBM ----
+        # LightGBM実行
         lgbm = lgb.LGBMRegressor(
             n_estimators=10000,
             learning_rate=0.03,
             num_leaves=64,  # 1本の木の最大葉数
-            subsample=0.8,  # 行方向のサンプリング 毎回データの80%を使って木を作る
-            colsample_bytree=0.8,  # 列方向サンプリング 毎回80%の特徴量で木を作る
+            subsample=0.8,  # 行方向のサンプリング(データの何%を使って木を作るか)
+            colsample_bytree=0.8,  # 列方向サンプリング(何%の特徴量で木を作るか)
             random_state=run_seed,
             n_jobs=-1,
-            verbosity=-1,  # ログ非表示
+            verbosity=-1,
         )
         lgbm.fit(
             X_tr_lgb, y_tr,
             eval_set=[(X_va_lgb, y_va)],
             eval_metric="rmse",
             callbacks=[lgb.early_stopping(stopping_rounds=200, verbose=False)],
-            categorical_feature=cat_cols,  # カテゴリ列を明示
+            categorical_feature=cat_cols,
         )
         pred_lgb = lgbm.predict(X_va_lgb, num_iteration=lgbm.best_iteration_)
-        lgb_rmses.append(rmse(y_va, pred_lgb))
-        lgb_maes.append(mae(y_va, pred_lgb))
-
-        # ★追加：正解率用に保存
-        lgb_all_true_list.append(y_va.to_numpy())
         lgb_all_pred_list.append(np.asarray(pred_lgb))
-
-        # ★追加：LightGBMの特徴量重要度（gain）
         lgb_importances.append(
             lgbm.booster_.feature_importance(importance_type="gain"))
 
-        """
-        print(
-            f"[Fold {fold}] "
-            f"CatBoost RMSE={cb_rmses[-1]:.5f}, MAE={cb_maes[-1]:.5f} | "
-            f"LightGBM RMSE={lgb_rmses[-1]:.5f}, MAE={lgb_maes[-1]:.5f}"
-        )
-        """
-
-    # ★追加：全foldをまとめて正解率計算
-    cb_all_true = np.concatenate(cb_all_true_list)
+    all_true = np.concatenate(all_true_list)
     cb_all_pred = np.concatenate(cb_all_pred_list)
-    lgb_all_true = np.concatenate(lgb_all_true_list)
     lgb_all_pred = np.concatenate(lgb_all_pred_list)
 
-    cb_mae_all = mae(cb_all_true, cb_all_pred)
-    lgb_mae_all = mae(lgb_all_true, lgb_all_pred)
-    cb_rmse_all = rmse(cb_all_true, cb_all_pred)
-    lgb_rmse_all = rmse(lgb_all_true, lgb_all_pred)
+    # MAE、RMSE
+    cb_mae_all = mae(all_true, cb_all_pred)
+    lgb_mae_all = mae(all_true, lgb_all_pred)
+    cb_rmse_all = rmse(all_true, cb_all_pred)
+    lgb_rmse_all = rmse(all_true, lgb_all_pred)
 
-    cb_acc = tolerance_accuracy(cb_all_true, cb_all_pred, tolerance_ratio=0.05)
-    lgb_acc = tolerance_accuracy(
-        lgb_all_true, lgb_all_pred, tolerance_ratio=0.05)
+    # 正解率
+    cb_acc = tolerance_accuracy(all_true, cb_all_pred, tolerance_ratio)
+    lgb_acc = tolerance_accuracy(all_true, lgb_all_pred, tolerance_ratio)
 
-    timestamp = datetime.now().strftime("%m%d%H%M%S")
-    timestamp_console = datetime.now().strftime("%m/%d %H:%M:%S")
+    result = {
+        "run_no": run_no,
+        "CB_RMSE": cb_rmse_all,
+        "CB_MAE": cb_mae_all,
+        "CB_ACC": cb_acc,
+        "LG_RMSE": lgb_rmse_all,
+        "LG_MAE": lgb_mae_all,
+        "LG_ACC": lgb_acc,
+    }
 
-    if (acc):
-        print(
-            f"{timestamp_console} {run_no:4d}   {cb_rmse_all:.2f}  {cb_mae_all:.2f} {cb_acc:.4f} ", end="")
-        print(
-            f"  {lgb_rmse_all:.2f}  {lgb_mae_all:.2f} {lgb_acc:.4f}", end="")
-    else:
-        print(
-            f"{timestamp_console} {run_no:4d}   {cb_rmse_all:.2f}  {cb_mae_all:.2f} ", end="")
-        print(
-            f"  {lgb_rmse_all:.2f}  {lgb_mae_all:.2f}", end="")
-    print()
-
-    # print("\n== Difference (LightGBM - CatBoost) ==")
-    # print(f"RMSE diff mean={np.mean(np.array(lgb_rmses) - np.array(cb_rmses)):.5f}")
-    # print(f"MAE  diff mean={np.mean(np.array(lgb_maes) - np.array(cb_maes)):.5f}")
-
-    # ------------------------
-    # 5) 全フォールド平均の寄与率(%)を出力
-    # ------------------------
-    # print("\n===== Feature Importance (Mean over folds) =====")
-
-    # CatBoost
-    mean_cb_imp = np.mean(np.asarray(cb_importances), axis=0)
-    cb_imp_df = to_contrib_df(list(X_cb.columns), mean_cb_imp)
-
-    # print("\n--- CatBoost (Mean Importance + Contribution%) ---")
-    # print(cb_imp_df.head(args.top_k))
-
-    # LightGBM
-    mean_lgb_imp = np.mean(np.asarray(lgb_importances), axis=0)
-    lgb_imp_df = to_contrib_df(list(X_lgb.columns), mean_lgb_imp)
-
-    # print("\n--- LightGBM (Mean Importance[gain] + Contribution%) ---")
-    # print(lgb_imp_df.head(args.top_k))
-
-    # ------------------------
-    # Excel保存（シート追加）
-    # ------------------------
-
-    # ---- CatBoost ----
-    cat_file = "result/result_catboost_"+result+"_100.xlsx"
-
-    if Path(cat_file).exists():
-        with pd.ExcelWriter(cat_file, engine="openpyxl", mode="a", if_sheet_exists="new") as writer:
-            cb_imp_df.to_excel(writer, sheet_name=timestamp, index=False)
-    else:
-        with pd.ExcelWriter(cat_file, engine="openpyxl") as writer:
-            cb_imp_df.to_excel(writer, sheet_name=timestamp, index=False)
-
-    # ---- LightGBM ----
-    lgb_file = "result/result_lightgbm_"+result+"_100.xlsx"
-
-    if Path(lgb_file).exists():
-        with pd.ExcelWriter(lgb_file, engine="openpyxl", mode="a", if_sheet_exists="new") as writer:
-            lgb_imp_df.to_excel(writer, sheet_name=timestamp, index=False)
-    else:
-        with pd.ExcelWriter(lgb_file, engine="openpyxl") as writer:
-            lgb_imp_df.to_excel(writer, sheet_name=timestamp, index=False)
+    # 重要度のDataFrameを生成
+    cb_imp_df = build_importance_df(
+        features=list(X_cb.columns),
+        importances_list=cb_importances,
+        item_map_df=item_map_df,
+        run_no=run_no,
+    )
+    lgb_imp_df = build_importance_df(
+        features=list(X_lgb.columns),
+        importances_list=lgb_importances,
+        item_map_df=item_map_df,
+        run_no=run_no,
+    )
+    return result, cb_imp_df, lgb_imp_df
 
 
 def main():
+    filename = "result/result_" + datetime.now().strftime("%Y%m%dT%H%M%S")+".xlsx"
+
     parser = argparse.ArgumentParser()
-    parser.add_argument("--acc", action="store_true", help="正解率表示")
     parser.add_argument("--data", required=True, help="Excelファイルパス")
-    parser.add_argument("--result", required=True, help="結果を保存するExcelファイル名")
-    parser.add_argument("--sheet", default=0, help="シート名")
-    parser.add_argument("--n_splits", type=int, default=5, help="CV分割数")
+    parser.add_argument("--result", default=filename, help="結果保存用Excelファイルパス")
+    parser.add_argument("--n_splits", type=int, default=5, help="k分割交差検証のkの値")
     parser.add_argument("--seed", type=int, default=42, help="乱数シード")
+    parser.add_argument("--ratio", type=float, default=0.05, help="正解率")
+    parser.add_argument("--num_exec", type=int, default=10, help="k分割交差検証の回数")
     args = parser.parse_args()
+    data_file = args.data
+    result_file = args.result
 
-    timestamp_console = datetime.now().strftime("%m/%d %H:%M:%S")
-    print(timestamp_console+" start")
+    print(filename)
+    timestamp = datetime.now().strftime("%m/%d %H:%M:%S")
+    print(timestamp+" start")
     print()
+    print("     timestamp   no CB_RMSE CB_MAE CB_ACC LG_RMSE LG_MAE LG_ACC")
 
-    if (args.acc):
-        print("     timestamp   no CB_RMSE CB_MAE CB_ACC LG_RMSE LG_MAE LG_ACC")
-    else:
-        print("     timestamp   no CB_RMSE CB_MAE LG_RMSE LG_MAE")
-    for count in range(100):
-        run_experiment(run_seed=42 + count, acc=args.acc, run_no=count +
-                       1, data=args.data, result=args.result)
+    result_list = []
+    cb_imp_df_list = []
+    lgb_imp_df_list = []
+
+    # k分割交差検証を実行
+    for count in range(args.num_exec):
+        result, cb_imp_df, lgb_imp_df = run_experiment(
+            run_seed=args.seed + count,
+            run_no=count + 1,
+            data_file=data_file,
+            n_splits=args.n_splits,
+            tolerance_ratio=args.ratio,
+        )
+        timestamp = datetime.now().strftime("%m/%d %H:%M:%S")
+        print(
+            f"{timestamp} {result['run_no']:4d}   "
+            f"{result['CB_RMSE']:.2f}  "
+            f"{result['CB_MAE']:.2f} "
+            f"{result['CB_ACC']:.4f} "
+            f"  {result['LG_RMSE']:.2f}  "
+            f"{result['LG_MAE']:.2f} "
+            f"{result['LG_ACC']:.4f}"
+        )
+        result_list.append(result)
+        cb_imp_df_list.append(cb_imp_df)
+        lgb_imp_df_list.append(lgb_imp_df)
+
+    result_df = pd.DataFrame(result_list)
+    cb_pivot_df = build_importance_pivot_df(cb_imp_df_list)
+    lgb_pivot_df = build_importance_pivot_df(lgb_imp_df_list)
+
+    with pd.ExcelWriter(result_file, engine="openpyxl") as writer:
+        result_df.to_excel(writer, index=False, sheet_name="result")
+        cb_pivot_df.to_excel(
+            writer,
+            sheet_name="catboost_importance",
+            index=False,
+        )
+        lgb_pivot_df.to_excel(
+            writer,
+            sheet_name="lightgbm_importance",
+            index=False,
+        )
 
 
 if __name__ == "__main__":

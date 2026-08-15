@@ -2,3 +2,6 @@ data
 result
 /test.py
 .env
+configs
+*.xlsx
+__pycache__

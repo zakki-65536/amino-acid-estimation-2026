@@ -654,6 +654,56 @@ def create_all_data(
 
   return all_data
 
+def evaluate_lightgbm(
+  X_original: pd.DataFrame,
+  y: pd.Series,
+  config: dict
+) -> dict:
+  target_config = config["target"]
+
+  all_data = create_all_data(
+    X=X_original,
+    y=y,
+    target_id=str(target_config["id"])
+  )
+
+  X, feature_name_map = rename_features_for_lightgbm(
+    X_original
+  )
+
+  is_classification = (
+    target_config.get("ratios") is not None
+    or target_config.get("cutoffs") is not None
+  )
+
+  if is_classification:
+    result_sheets, feature_importance = (
+      run_classification(
+        X=X,
+        y=y,
+        feature_name_map=feature_name_map
+      )
+    )
+
+    task_type = "classification"
+
+  else:
+    result_sheets, feature_importance = (
+      run_regression(
+        X=X,
+        y=y,
+        feature_name_map=feature_name_map
+      )
+    )
+
+    task_type = "regression"
+
+  return {
+    "task_type": task_type,
+    "all_data": all_data,
+    "result_sheets": result_sheets,
+    "feature_importance": feature_importance,
+  }
 
 def save_result(
   output_path: Path,
@@ -754,44 +804,18 @@ def run_lightgbm(
       data_path
     )
 
-  target_config = config["target"]
-
-  all_data = create_all_data(
-    X=X_original,
+  evaluation = evaluate_lightgbm(
+    X_original=X_original,
     y=y,
-    target_id=str(target_config["id"])
+    config=config
   )
 
-  X, feature_name_map = rename_features_for_lightgbm(
-    X_original
-  )
-
-  is_classification = (
-    target_config.get("ratios") is not None
-    or target_config.get("cutoffs") is not None
-  )
-
-  if is_classification:
-    result_sheets, feature_importance = (
-      run_classification(
-        X=X,
-        y=y,
-        feature_name_map=feature_name_map
-      )
-    )
-
-    task_type = "classification"
-
-  else:
-    result_sheets, feature_importance = (
-      run_regression(
-        X=X,
-        y=y,
-        feature_name_map=feature_name_map
-      )
-    )
-
-    task_type = "regression"
+  task_type = evaluation["task_type"]
+  all_data = evaluation["all_data"]
+  result_sheets = evaluation["result_sheets"]
+  feature_importance = evaluation[
+    "feature_importance"
+  ]
 
   experiment_name = config[
     "experiment_name"
@@ -813,8 +837,8 @@ def run_lightgbm(
 
   print(f"実験名: {experiment_name}")
   print(f"処理: {task_type}")
-  print(f"被験者数: {len(X)}")
-  print(f"説明変数数: {X.shape[1]}")
+  print(f"被験者数: {len(X_original)}")
+  print(f"説明変数数: {X_original.shape[1]}")
   print(f"分割数: {N_SPLITS}")
   print(f"反復回数: {N_REPEATS}")
   print(f"学習回数: {N_SPLITS * N_REPEATS}")
@@ -827,7 +851,7 @@ def run_lightgbm(
   )
 
   print(f"\n保存先: {output_path}")
-  
+
   if "threshold_summary" in result_sheets:
     threshold_summary = result_sheets[
       "threshold_summary"

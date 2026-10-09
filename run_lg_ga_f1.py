@@ -7,9 +7,21 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from lightgbm import LGBMClassifier
+from sklearn.metrics import f1_score
+from sklearn.model_selection import (
+    StratifiedKFold,
+    TunedThresholdClassifierCV,
+    train_test_split,
+)
 
 from filter import filter_data
 from run_lightgbm import (
+    INNER_N_SPLITS,
+    MODEL_PARAMS,
+    RANDOM_STATE,
+    THRESHOLD_COUNT,
+    THRESHOLD_SCORING,
     evaluate_lightgbm,
     save_result,
 )
@@ -35,6 +47,226 @@ def get_metric(
 
     return float(row.iloc[0][statistic])
 
+
+def split_development_and_test(
+    X_all: pd.DataFrame,
+    y_all: pd.Series,
+    test_size: float,
+    split_seed: int,
+) -> tuple[
+    pd.DataFrame,
+    pd.DataFrame,
+    pd.Series,
+    pd.Series,
+    np.ndarray,
+    np.ndarray,
+]:
+    """
+    全データをGA用の学習データと、最後まで隔離するテストデータに分割する。
+    二値分類の比率を維持するため stratify=y_all を使用する。
+    """
+    if not 0.0 < test_size < 1.0:
+        raise ValueError(
+            "test_size は0より大きく1より小さくしてください。"
+        )
+
+    all_indexes = np.arange(len(X_all))
+
+    train_indexes, test_indexes = train_test_split(
+        all_indexes,
+        test_size=test_size,
+        random_state=split_seed,
+        stratify=y_all,
+    )
+
+    X_train = X_all.iloc[train_indexes].reset_index(drop=True)
+    X_test = X_all.iloc[test_indexes].reset_index(drop=True)
+    y_train = y_all.iloc[train_indexes].reset_index(drop=True)
+    y_test = y_all.iloc[test_indexes].reset_index(drop=True)
+
+    return (
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+        train_indexes,
+        test_indexes,
+    )
+
+
+def evaluate_final_test_once(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    best_features: list[str],
+    ga_cv_f1: float,
+    train_indexes: np.ndarray,
+    test_indexes: np.ndarray,
+    test_size: float,
+    split_seed: int,
+    output_dir: Path,
+) -> tuple[Path, float]:
+    """
+    GA終了後に、最良特徴量集合を固定して1回だけ最終テスト評価する。
+
+    テストデータはGAのFitness計算・特徴量選択・閾値決定には一切使用しない。
+    F1は分類閾値に依存するため、学習データだけを使った内側CVで
+    run_lightgbm.py と同じ方法により閾値を決定した後、
+    テストデータを1回だけ予測してF1を算出する。
+    """
+    X_train_best = X_train[best_features].copy()
+    X_test_best = X_test[best_features].copy()
+
+    # LightGBMで安全に扱える共通の特徴量名へ変更する。
+    safe_names = [
+        f"feature_{index}"
+        for index in range(len(best_features))
+    ]
+    X_train_best.columns = safe_names
+    X_test_best.columns = safe_names
+
+    # 最終TESTは使わず、学習データ内だけで分類閾値を決定する。
+    inner_cv = StratifiedKFold(
+        n_splits=INNER_N_SPLITS,
+        shuffle=True,
+        random_state=RANDOM_STATE,
+    )
+
+    base_model = LGBMClassifier(
+        **MODEL_PARAMS
+    )
+
+    model = TunedThresholdClassifierCV(
+        estimator=base_model,
+        scoring=THRESHOLD_SCORING,
+        response_method="predict_proba",
+        thresholds=THRESHOLD_COUNT,
+        cv=inner_cv,
+        refit=True,
+        n_jobs=1,
+        store_cv_results=True,
+    )
+
+    model.fit(
+        X_train_best,
+        y_train,
+    )
+
+    if len(model.classes_) != 2:
+        raise ValueError(
+            "最終F1評価は二値分類を前提としています。"
+        )
+
+    predicted = model.predict(
+        X_test_best
+    )
+
+    probabilities = model.predict_proba(
+        X_test_best
+    )
+
+    positive_label = model.classes_[1]
+    positive_probabilities = probabilities[:, 1]
+    selected_threshold = float(
+        model.best_threshold_
+    )
+
+    final_test_f1 = float(
+        f1_score(
+            y_test,
+            predicted,
+            pos_label=positive_label,
+            zero_division=0,
+        )
+    )
+
+    summary = pd.DataFrame([{
+        "ga_cv_best_f1": ga_cv_f1,
+        "final_test_f1": final_test_f1,
+        "total_count": len(X_train) + len(X_test),
+        "train_count": len(X_train),
+        "test_count": len(X_test),
+        "test_size": test_size,
+        "test_split_seed": split_seed,
+        "feature_count": len(best_features),
+        "positive_label": positive_label,
+        "selected_threshold": selected_threshold,
+        "threshold_scoring": THRESHOLD_SCORING,
+    }])
+
+    best_features_df = pd.DataFrame({
+        "feature": best_features,
+    })
+
+    predictions = pd.DataFrame({
+        "filtered_row": test_indexes + 1,
+        "actual": y_test.to_numpy(),
+        "predicted": predicted,
+        "probability_positive": positive_probabilities,
+        "selected_threshold": selected_threshold,
+    }).sort_values(
+        "filtered_row"
+    ).reset_index(drop=True)
+
+    fitted_lightgbm = model.estimator_
+
+    feature_importance = pd.DataFrame({
+        "feature": best_features,
+        "importance": fitted_lightgbm.feature_importances_,
+    }).sort_values(
+        ["importance", "feature"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+    split_data = pd.concat([
+        pd.DataFrame({
+            "filtered_row": train_indexes + 1,
+            "split": "train",
+        }),
+        pd.DataFrame({
+            "filtered_row": test_indexes + 1,
+            "split": "test",
+        }),
+    ], ignore_index=True).sort_values(
+        "filtered_row"
+    ).reset_index(drop=True)
+
+    output_path = (
+        output_dir / "final_test_result.xlsx"
+    )
+
+    with pd.ExcelWriter(
+        output_path,
+        engine="openpyxl",
+    ) as writer:
+        summary.to_excel(
+            writer,
+            sheet_name="summary",
+            index=False,
+        )
+        best_features_df.to_excel(
+            writer,
+            sheet_name="best_features",
+            index=False,
+        )
+        predictions.to_excel(
+            writer,
+            sheet_name="test_predictions",
+            index=False,
+        )
+        feature_importance.to_excel(
+            writer,
+            sheet_name="feature_importance",
+            index=False,
+        )
+        split_data.to_excel(
+            writer,
+            sheet_name="data_split",
+            index=False,
+        )
+
+    return output_path, final_test_f1
 
 def chromosome_to_features(
     chromosome: np.ndarray,
@@ -143,7 +375,7 @@ def evaluate_chromosome(
 ) -> float:
     """
     chromosome が表す特徴量集合で LightGBM を評価し、
-    F1値の平均値を Fitness として返す。
+    f1 の平均値を Fitness として返す。
 
     同じ染色体はキャッシュから返し、再学習を避ける。
     """
@@ -376,6 +608,8 @@ def run_genetic_algorithm(
     tournament_size: int = 3,
     min_features: int = 1,
     max_features: int | None = None,
+    test_size: float = 0.2,
+    test_split_seed: int = 42,
     random_seed: int = 42,
     output_path: str | Path | None = None,
 ) -> Path:
@@ -393,6 +627,25 @@ def run_genetic_algorithm(
         X_all.columns
         .astype(str)
         .tolist()
+    )
+
+    if y.nunique() != 2:
+        raise ValueError(
+            "このGAプログラムのFitness=f1は二値分類を前提としています。"
+        )
+
+    (
+        X_train,
+        X_test,
+        y_train,
+        y_test,
+        train_indexes,
+        test_indexes,
+    ) = split_development_and_test(
+        X_all=X_all,
+        y_all=y,
+        test_size=test_size,
+        split_seed=test_split_seed,
     )
 
     feature_count = len(all_features)
@@ -462,7 +715,7 @@ def run_genetic_algorithm(
     if output_path is None:
         output_dir = (
             RESULT_DIR
-            / f"GA_{experiment_name}"
+            / f"GA_F1_{experiment_name}"
         )
     else:
         output_dir = Path(output_path)
@@ -482,6 +735,21 @@ def run_genetic_algorithm(
     )
     print(
         f"被験者数: {len(X_all)}"
+    )
+    print(
+        f"GA用学習データ数: {len(X_train)}"
+    )
+    print(
+        f"最終テストデータ数: {len(X_test)}"
+    )
+    print(
+        f"テスト割合: {test_size}"
+    )
+    print(
+        f"テスト分割seed: {test_split_seed}"
+    )
+    print(
+        "※最終テストデータはGA終了まで使用しません。"
     )
     print(
         f"全特徴量数: {feature_count}"
@@ -546,8 +814,8 @@ def run_genetic_algorithm(
             fitness = evaluate_chromosome(
                 chromosome=chromosome,
                 all_features=all_features,
-                X_all=X_all,
-                y=y,
+                X_all=X_train,
+                y=y_train,
                 config=config,
                 fitness_cache=fitness_cache,
             )
@@ -777,15 +1045,14 @@ def run_genetic_algorithm(
     )
 
     print(
-        "\n===== 最良個体の再評価 ====="
+        "\n===== GAで決定した最良特徴量集合 ====="
     )
     print(
-        f"最良 F1: "
+        "GA CV 最良F1: "
         f"{global_best_fitness:.6f}"
     )
     print(
-        f"特徴量数: "
-        f"{len(best_features)}"
+        f"特徴量数: {len(best_features)}"
     )
     print(
         "特徴量: "
@@ -799,34 +1066,36 @@ def run_genetic_algorithm(
         best_features.copy()
     )
 
-    X_best = X_all[
+    # 最良特徴量集合のCV詳細も、GA用学習データだけで保存する。
+    # 最終テストデータはここでも使用しない。
+    X_best_train = X_train[
         best_features
     ].copy()
 
-    best_evaluation = evaluate_lightgbm(
-        X_original=X_best,
-        y=y,
+    best_cv_evaluation = evaluate_lightgbm(
+        X_original=X_best_train,
+        y=y_train,
         config=best_config,
     )
 
-    best_result_path = (
+    best_cv_result_path = (
         output_dir
-        / "best_result.xlsx"
+        / "best_cv_result.xlsx"
     )
 
     save_result(
-        output_path=best_result_path,
+        output_path=best_cv_result_path,
         config=best_config,
-        all_data=best_evaluation[
+        all_data=best_cv_evaluation[
             "all_data"
         ],
-        task_type=best_evaluation[
+        task_type=best_cv_evaluation[
             "task_type"
         ],
-        result_sheets=best_evaluation[
+        result_sheets=best_cv_evaluation[
             "result_sheets"
         ],
-        feature_importance=best_evaluation[
+        feature_importance=best_cv_evaluation[
             "feature_importance"
         ],
     )
@@ -848,12 +1117,46 @@ def run_genetic_algorithm(
     )
 
     print(
-        f"\n最良個体の詳細: "
-        f"{best_result_path}"
+        "\n===== 最終テスト評価 ====="
     )
     print(
-        f"GA集計結果: "
-        f"{summary_path}"
+        "GAで一度も使用していないテストデータを、"
+        "ここで初めて使用します。"
+    )
+
+    (
+        final_test_result_path,
+        final_test_f1,
+    ) = evaluate_final_test_once(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        best_features=best_features,
+        ga_cv_f1=global_best_fitness,
+        train_indexes=train_indexes,
+        test_indexes=test_indexes,
+        test_size=test_size,
+        split_seed=test_split_seed,
+        output_dir=output_dir,
+    )
+
+    print(
+        "GA CV 最良F1: "
+        f"{global_best_fitness:.6f}"
+    )
+    print(
+        "最終TEST F1: "
+        f"{final_test_f1:.6f}"
+    )
+    print(
+        f"\n最良特徴量のCV詳細: {best_cv_result_path}"
+    )
+    print(
+        f"GA集計結果: {summary_path}"
+    )
+    print(
+        f"最終テスト結果: {final_test_result_path}"
     )
 
     return summary_path
@@ -936,6 +1239,26 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--test-size",
+        type=float,
+        default=0.2,
+        help=(
+            "最終テストデータの割合。"
+            "デフォルトは0.2（8:2分割）"
+        ),
+    )
+
+    parser.add_argument(
+        "--test-split-seed",
+        type=int,
+        default=42,
+        help=(
+            "学習/最終テスト分割専用の乱数シード。"
+            "GAのseedとは独立"
+        ),
+    )
+
+    parser.add_argument(
         "--seed",
         type=int,
         default=42,
@@ -972,6 +1295,10 @@ def main() -> None:
         ),
         max_features=(
             args.max_features
+        ),
+        test_size=args.test_size,
+        test_split_seed=(
+            args.test_split_seed
         ),
         random_seed=args.seed,
         output_path=args.output,

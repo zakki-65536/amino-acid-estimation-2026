@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from lightgbm import LGBMClassifier
 from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import RepeatedStratifiedKFold
 
 from filter import filter_data
 from run_lightgbm import (
@@ -21,6 +21,11 @@ from run_lightgbm import (
 
 BASE_DIR = Path(__file__).resolve().parent
 RESULT_DIR = BASE_DIR / "result"
+
+# 外側CV: 5-foldを10回反復 = 50 outer splits
+OUTER_N_SPLITS = 5
+OUTER_N_REPEATS = 10
+OUTER_RANDOM_STATE = 42
 
 
 def get_metric(
@@ -40,193 +45,18 @@ def get_metric(
     return float(row.iloc[0][statistic])
 
 
-def split_development_and_test(
-    X_all: pd.DataFrame,
-    y_all: pd.Series,
-    test_size: float,
-    split_seed: int,
-) -> tuple[
-    pd.DataFrame,
-    pd.DataFrame,
-    pd.Series,
-    pd.Series,
-    np.ndarray,
-    np.ndarray,
-]:
-    """
-    全データをGA用の学習データと、最後まで隔離するテストデータに分割する。
-    二値分類の比率を維持するため stratify=y_all を使用する。
-    """
-    if not 0.0 < test_size < 1.0:
-        raise ValueError(
-            "test_size は0より大きく1より小さくしてください。"
-        )
+def get_outer_repeat_and_fold(
+    split_number: int,
+) -> tuple[int, int]:
+    repeat_number = (
+        (split_number - 1) // OUTER_N_SPLITS
+    ) + 1
 
-    all_indexes = np.arange(len(X_all))
+    fold_number = (
+        (split_number - 1) % OUTER_N_SPLITS
+    ) + 1
 
-    train_indexes, test_indexes = train_test_split(
-        all_indexes,
-        test_size=test_size,
-        random_state=split_seed,
-        stratify=y_all,
-    )
-
-    X_train = X_all.iloc[train_indexes].reset_index(drop=True)
-    X_test = X_all.iloc[test_indexes].reset_index(drop=True)
-    y_train = y_all.iloc[train_indexes].reset_index(drop=True)
-    y_test = y_all.iloc[test_indexes].reset_index(drop=True)
-
-    return (
-        X_train,
-        X_test,
-        y_train,
-        y_test,
-        train_indexes,
-        test_indexes,
-    )
-
-
-def evaluate_final_test_once(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_test: pd.DataFrame,
-    y_test: pd.Series,
-    best_features: list[str],
-    ga_cv_auc: float,
-    train_indexes: np.ndarray,
-    test_indexes: np.ndarray,
-    test_size: float,
-    split_seed: int,
-    output_dir: Path,
-) -> tuple[Path, float]:
-    """
-    GA終了後に、最良特徴量集合を固定して1回だけ最終テスト評価する。
-
-    テストデータはGAのFitness計算・特徴量選択には一切使用しない。
-    AUCは閾値に依存しないため、学習データ全体でLightGBMを1回学習し、
-    テストデータのpredict_probaから算出する。
-    """
-    X_train_best = X_train[best_features].copy()
-    X_test_best = X_test[best_features].copy()
-
-    # LightGBMで安全に扱える共通の特徴量名へ変更する。
-    safe_names = [
-        f"feature_{index}"
-        for index in range(len(best_features))
-    ]
-    X_train_best.columns = safe_names
-    X_test_best.columns = safe_names
-
-    model = LGBMClassifier(
-        **MODEL_PARAMS
-    )
-    model.fit(
-        X_train_best,
-        y_train,
-    )
-
-    probabilities = model.predict_proba(
-        X_test_best
-    )
-
-    if len(model.classes_) != 2:
-        raise ValueError(
-            "最終AUC評価は二値分類を前提としています。"
-        )
-
-    positive_label = model.classes_[1]
-    positive_index = 1
-    positive_probabilities = probabilities[
-        :, positive_index
-    ]
-
-    final_test_auc = float(
-        roc_auc_score(
-            y_test,
-            positive_probabilities,
-        )
-    )
-
-    summary = pd.DataFrame([{
-        "ga_cv_best_auc": ga_cv_auc,
-        "final_test_auc": final_test_auc,
-        "total_count": len(X_train) + len(X_test),
-        "train_count": len(X_train),
-        "test_count": len(X_test),
-        "test_size": test_size,
-        "test_split_seed": split_seed,
-        "feature_count": len(best_features),
-        "positive_label": positive_label,
-    }])
-
-    best_features_df = pd.DataFrame({
-        "feature": best_features,
-    })
-
-    predictions = pd.DataFrame({
-        "filtered_row": test_indexes + 1,
-        "actual": y_test.to_numpy(),
-        "probability_positive": positive_probabilities,
-    }).sort_values(
-        "filtered_row"
-    ).reset_index(drop=True)
-
-    feature_importance = pd.DataFrame({
-        "feature": best_features,
-        "importance": model.feature_importances_,
-    }).sort_values(
-        ["importance", "feature"],
-        ascending=[False, True],
-    ).reset_index(drop=True)
-
-    split_data = pd.concat([
-        pd.DataFrame({
-            "filtered_row": train_indexes + 1,
-            "split": "train",
-        }),
-        pd.DataFrame({
-            "filtered_row": test_indexes + 1,
-            "split": "test",
-        }),
-    ], ignore_index=True).sort_values(
-        "filtered_row"
-    ).reset_index(drop=True)
-
-    output_path = (
-        output_dir / "final_test_result.xlsx"
-    )
-
-    with pd.ExcelWriter(
-        output_path,
-        engine="openpyxl",
-    ) as writer:
-        summary.to_excel(
-            writer,
-            sheet_name="summary",
-            index=False,
-        )
-        best_features_df.to_excel(
-            writer,
-            sheet_name="best_features",
-            index=False,
-        )
-        predictions.to_excel(
-            writer,
-            sheet_name="test_predictions",
-            index=False,
-        )
-        feature_importance.to_excel(
-            writer,
-            sheet_name="feature_importance",
-            index=False,
-        )
-        split_data.to_excel(
-            writer,
-            sheet_name="data_split",
-            index=False,
-        )
-
-    return output_path, final_test_auc
+    return repeat_number, fold_number
 
 
 def chromosome_to_features(
@@ -329,16 +159,16 @@ def initialize_population(
 def evaluate_chromosome(
     chromosome: np.ndarray,
     all_features: list[str],
-    X_all: pd.DataFrame,
-    y: pd.Series,
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
     config: dict,
     fitness_cache: dict[tuple[int, ...], float],
 ) -> float:
     """
-    chromosome が表す特徴量集合で LightGBM を評価し、
-    roc_auc の平均値を Fitness として返す。
+    outer TRAINだけを使って候補特徴量集合をCV評価し、
+    roc_auc の平均値をGAのFitnessとして返す。
 
-    同じ染色体はキャッシュから返し、再学習を避ける。
+    outer TESTはここでは一切使用しない。
     """
     key = tuple(int(x) for x in chromosome)
 
@@ -357,14 +187,14 @@ def evaluate_chromosome(
     current_config = copy.deepcopy(config)
     current_config["features"] = selected_features
 
-    X_current = X_all[
+    X_current = X_train[
         selected_features
     ].copy()
 
     try:
         evaluation = evaluate_lightgbm(
             X_original=X_current,
-            y=y,
+            y=y_train,
             config=current_config,
         )
 
@@ -558,7 +388,477 @@ def save_ga_summary(
     return summary_path
 
 
-def run_genetic_algorithm(
+def run_ga_on_outer_train(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    config: dict,
+    all_features: list[str],
+    output_dir: Path,
+    population_size: int,
+    generations: int,
+    crossover_rate: float,
+    mutation_rate: float,
+    elite_size: int,
+    tournament_size: int,
+    min_features: int,
+    max_features: int,
+    random_seed: int,
+) -> tuple[
+    list[str],
+    float,
+    np.ndarray,
+    Path,
+    Path,
+]:
+    """
+    1つのouter TRAIN内だけでGAを完結させる。
+    outer TESTは受け取らないため、特徴量決定に利用できない。
+    """
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    rng = np.random.default_rng(random_seed)
+
+    feature_count = len(all_features)
+
+    population = initialize_population(
+        population_size=population_size,
+        feature_count=feature_count,
+        min_features=min_features,
+        max_features=max_features,
+        rng=rng,
+    )
+
+    fitness_cache: dict[
+        tuple[int, ...],
+        float,
+    ] = {}
+
+    generation_history: list[dict] = []
+    individual_history: list[dict] = []
+
+    global_best_chromosome: np.ndarray | None = None
+    global_best_fitness = float("-inf")
+
+    for generation in range(
+        1,
+        generations + 1,
+    ):
+        print(
+            f"\n  ===== Generation "
+            f"{generation}/{generations} ====="
+        )
+
+        fitnesses: list[float] = []
+
+        for individual_index, chromosome in enumerate(
+            population,
+            start=1,
+        ):
+            fitness = evaluate_chromosome(
+                chromosome=chromosome,
+                all_features=all_features,
+                X_train=X_train,
+                y_train=y_train,
+                config=config,
+                fitness_cache=fitness_cache,
+            )
+
+            fitnesses.append(fitness)
+
+            selected_features = chromosome_to_features(
+                chromosome,
+                all_features,
+            )
+
+            individual_history.append({
+                "generation": generation,
+                "individual": individual_index,
+                "fitness_auc": fitness,
+                "feature_count": len(selected_features),
+                "features": ",".join(selected_features),
+                "chromosome": "".join(
+                    str(int(gene))
+                    for gene in chromosome
+                ),
+            })
+
+            print(
+                f"  Individual {individual_index:02d}: "
+                f"AUC={fitness:.6f}, "
+                f"features={len(selected_features)}"
+            )
+
+        finite_fitnesses = [
+            value
+            for value in fitnesses
+            if np.isfinite(value)
+        ]
+
+        if not finite_fitnesses:
+            raise RuntimeError(
+                "全個体の評価に失敗しました。"
+            )
+
+        best_index = int(np.argmax(fitnesses))
+        generation_best_fitness = float(
+            fitnesses[best_index]
+        )
+        generation_best_chromosome = (
+            population[best_index].copy()
+        )
+        generation_best_features = chromosome_to_features(
+            generation_best_chromosome,
+            all_features,
+        )
+
+        generation_mean = float(
+            np.mean(finite_fitnesses)
+        )
+        generation_std = float(
+            np.std(finite_fitnesses, ddof=0)
+        )
+
+        if generation_best_fitness > global_best_fitness:
+            global_best_fitness = generation_best_fitness
+            global_best_chromosome = (
+                generation_best_chromosome.copy()
+            )
+
+        generation_history.append({
+            "generation": generation,
+            "best_auc": generation_best_fitness,
+            "mean_auc": generation_mean,
+            "std_auc": generation_std,
+            "best_feature_count": len(
+                generation_best_features
+            ),
+            "best_features": ",".join(
+                generation_best_features
+            ),
+            "unique_evaluated_total": len(
+                fitness_cache
+            ),
+            "global_best_auc": global_best_fitness,
+        })
+
+        print(
+            "  世代最良 AUC: "
+            f"{generation_best_fitness:.6f}"
+        )
+        print(
+            "  世代平均 AUC: "
+            f"{generation_mean:.6f} ± {generation_std:.6f}"
+        )
+        print(
+            "  全世代最良 AUC: "
+            f"{global_best_fitness:.6f}"
+        )
+
+        if generation == generations:
+            break
+
+        sorted_indexes = sorted(
+            range(len(population)),
+            key=lambda i: fitnesses[i],
+            reverse=True,
+        )
+
+        next_population: list[np.ndarray] = [
+            population[i].copy()
+            for i in sorted_indexes[:elite_size]
+        ]
+
+        while len(next_population) < population_size:
+            parent1 = tournament_selection(
+                population=population,
+                fitnesses=fitnesses,
+                tournament_size=tournament_size,
+                rng=rng,
+            )
+            parent2 = tournament_selection(
+                population=population,
+                fitnesses=fitnesses,
+                tournament_size=tournament_size,
+                rng=rng,
+            )
+
+            child1, child2 = uniform_crossover(
+                parent1=parent1,
+                parent2=parent2,
+                crossover_rate=crossover_rate,
+                rng=rng,
+            )
+
+            child1 = mutate(
+                child1,
+                mutation_rate,
+                rng,
+            )
+            child2 = mutate(
+                child2,
+                mutation_rate,
+                rng,
+            )
+
+            child1 = repair_chromosome(
+                child1,
+                min_features=min_features,
+                max_features=max_features,
+                rng=rng,
+            )
+            child2 = repair_chromosome(
+                child2,
+                min_features=min_features,
+                max_features=max_features,
+                rng=rng,
+            )
+
+            next_population.append(child1)
+
+            if len(next_population) < population_size:
+                next_population.append(child2)
+
+        population = next_population
+
+    if global_best_chromosome is None:
+        raise RuntimeError(
+            "最良個体を取得できませんでした。"
+        )
+
+    best_features = chromosome_to_features(
+        global_best_chromosome,
+        all_features,
+    )
+
+    best_config = copy.deepcopy(config)
+    best_config["features"] = best_features.copy()
+
+    # outer TRAIN内での最良特徴量のCV詳細を保存する。
+    X_best_train = X_train[
+        best_features
+    ].copy()
+
+    best_cv_evaluation = evaluate_lightgbm(
+        X_original=X_best_train,
+        y=y_train,
+        config=best_config,
+    )
+
+    best_cv_result_path = (
+        output_dir / "best_cv_result.xlsx"
+    )
+
+    save_result(
+        output_path=best_cv_result_path,
+        config=best_config,
+        all_data=best_cv_evaluation["all_data"],
+        task_type=best_cv_evaluation["task_type"],
+        result_sheets=best_cv_evaluation["result_sheets"],
+        feature_importance=best_cv_evaluation[
+            "feature_importance"
+        ],
+    )
+
+    ga_summary_path = save_ga_summary(
+        output_dir=output_dir,
+        generation_history=generation_history,
+        individual_history=individual_history,
+        best_features=best_features,
+        all_features=all_features,
+        best_chromosome=global_best_chromosome,
+        fitness_cache=fitness_cache,
+    )
+
+    return (
+        best_features,
+        global_best_fitness,
+        global_best_chromosome,
+        best_cv_result_path,
+        ga_summary_path,
+    )
+
+
+def evaluate_outer_test_once(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    best_features: list[str],
+    test_indexes: np.ndarray,
+) -> tuple[
+    float,
+    pd.DataFrame,
+    pd.DataFrame,
+]:
+    """
+    GA終了後、固定した最良特徴量集合でouter TESTを1回だけ評価する。
+    """
+    X_train_best = X_train[best_features].copy()
+    X_test_best = X_test[best_features].copy()
+
+    safe_names = [
+        f"feature_{index}"
+        for index in range(len(best_features))
+    ]
+    X_train_best.columns = safe_names
+    X_test_best.columns = safe_names
+
+    model = LGBMClassifier(
+        **MODEL_PARAMS
+    )
+    model.fit(
+        X_train_best,
+        y_train,
+    )
+
+    probabilities = model.predict_proba(
+        X_test_best
+    )
+
+    if len(model.classes_) != 2:
+        raise ValueError(
+            "outer TESTのAUC評価は二値分類を前提としています。"
+        )
+
+    positive_label = model.classes_[1]
+    positive_probabilities = probabilities[:, 1]
+
+    test_auc = float(
+        roc_auc_score(
+            y_test,
+            positive_probabilities,
+        )
+    )
+
+    predictions = pd.DataFrame({
+        "filtered_row": test_indexes + 1,
+        "actual": y_test.to_numpy(),
+        "positive_label": positive_label,
+        "probability_positive": positive_probabilities,
+    })
+
+    feature_importance = pd.DataFrame({
+        "feature": best_features,
+        "importance": model.feature_importances_,
+    }).sort_values(
+        ["importance", "feature"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+    return (
+        test_auc,
+        predictions,
+        feature_importance,
+    )
+
+
+def save_outer_fold_result(
+    output_dir: Path,
+    repeat_number: int,
+    fold_number: int,
+    train_indexes: np.ndarray,
+    test_indexes: np.ndarray,
+    ga_cv_best_auc: float,
+    outer_test_auc: float,
+    best_features: list[str],
+    predictions: pd.DataFrame,
+    feature_importance: pd.DataFrame,
+) -> Path:
+    output_path = (
+        output_dir / "outer_test_result.xlsx"
+    )
+
+    summary = pd.DataFrame([{
+        "outer_repeat": repeat_number,
+        "outer_fold": fold_number,
+        "train_count": len(train_indexes),
+        "test_count": len(test_indexes),
+        "ga_cv_best_auc": ga_cv_best_auc,
+        "outer_test_auc": outer_test_auc,
+        "feature_count": len(best_features),
+    }])
+
+    best_features_df = pd.DataFrame({
+        "feature": best_features,
+    })
+
+    split_data = pd.concat([
+        pd.DataFrame({
+            "filtered_row": train_indexes + 1,
+            "split": "train",
+        }),
+        pd.DataFrame({
+            "filtered_row": test_indexes + 1,
+            "split": "test",
+        }),
+    ], ignore_index=True).sort_values(
+        "filtered_row"
+    ).reset_index(drop=True)
+
+    with pd.ExcelWriter(
+        output_path,
+        engine="openpyxl",
+    ) as writer:
+        summary.to_excel(
+            writer,
+            sheet_name="summary",
+            index=False,
+        )
+        best_features_df.to_excel(
+            writer,
+            sheet_name="best_features",
+            index=False,
+        )
+        predictions.to_excel(
+            writer,
+            sheet_name="test_predictions",
+            index=False,
+        )
+        feature_importance.to_excel(
+            writer,
+            sheet_name="feature_importance",
+            index=False,
+        )
+        split_data.to_excel(
+            writer,
+            sheet_name="data_split",
+            index=False,
+        )
+
+    return output_path
+
+
+def create_feature_selection_frequency(
+    feature_sets: pd.DataFrame,
+    all_features: list[str],
+    total_outer_splits: int,
+) -> pd.DataFrame:
+    counts = (
+        feature_sets["feature"]
+        .value_counts()
+        .reindex(all_features, fill_value=0)
+    )
+
+    result = pd.DataFrame({
+        "feature": all_features,
+        "selected_count": [
+            int(counts[feature])
+            for feature in all_features
+        ],
+    })
+
+    result["selection_rate"] = (
+        result["selected_count"]
+        / total_outer_splits
+    )
+
+    return result.sort_values(
+        ["selected_count", "feature"],
+        ascending=[False, True],
+    ).reset_index(drop=True)
+
+
+def run_genetic_algorithm_repeated_cv(
     config_path: str | Path,
     data_path: str | Path | None = None,
     population_size: int = 20,
@@ -569,19 +869,23 @@ def run_genetic_algorithm(
     tournament_size: int = 3,
     min_features: int = 1,
     max_features: int | None = None,
-    test_size: float = 0.2,
-    test_split_seed: int = 42,
     random_seed: int = 42,
+    outer_random_state: int = OUTER_RANDOM_STATE,
     output_path: str | Path | None = None,
 ) -> Path:
     if data_path is None:
-        X_all, y, config = filter_data(
+        X_all, y_all, config = filter_data(
             config_path
         )
     else:
-        X_all, y, config = filter_data(
+        X_all, y_all, config = filter_data(
             config_path,
             data_path,
+        )
+
+    if y_all.nunique() != 2:
+        raise ValueError(
+            "このGAプログラムのFitness=roc_aucは二値分類を前提としています。"
         )
 
     all_features = (
@@ -589,26 +893,6 @@ def run_genetic_algorithm(
         .astype(str)
         .tolist()
     )
-
-    if y.nunique() != 2:
-        raise ValueError(
-            "このGAプログラムのFitness=roc_aucは二値分類を前提としています。"
-        )
-
-    (
-        X_train,
-        X_test,
-        y_train,
-        y_test,
-        train_indexes,
-        test_indexes,
-    ) = split_development_and_test(
-        X_all=X_all,
-        y_all=y,
-        test_size=test_size,
-        split_seed=test_split_seed,
-    )
-
     feature_count = len(all_features)
 
     if feature_count == 0:
@@ -650,7 +934,6 @@ def run_genetic_algorithm(
         )
 
     if mutation_rate is None:
-        # 特徴量数に応じたGAでよく使われる初期値。
         mutation_rate = 1.0 / feature_count
 
     if not 0.0 <= mutation_rate <= 1.0:
@@ -663,464 +946,386 @@ def run_genetic_algorithm(
             "crossover_rate は0～1にしてください。"
         )
 
-    random.seed(random_seed)
-    np.random.seed(random_seed)
-    rng = np.random.default_rng(
-        random_seed
-    )
-
-    experiment_name = config[
-        "experiment_name"
-    ]
+    experiment_name = config["experiment_name"]
 
     if output_path is None:
         output_dir = (
             RESULT_DIR
-            / f"GA_{experiment_name}"
+            / f"GA_RepeatedCV_{experiment_name}"
         )
     else:
         output_dir = Path(output_path)
 
         if not output_dir.is_absolute():
-            output_dir = (
-                BASE_DIR / output_dir
-            )
+            output_dir = BASE_DIR / output_dir
 
     output_dir.mkdir(
         parents=True,
         exist_ok=True,
     )
 
+    outer_cv = RepeatedStratifiedKFold(
+        n_splits=OUTER_N_SPLITS,
+        n_repeats=OUTER_N_REPEATS,
+        random_state=outer_random_state,
+    )
+
+    total_outer_splits = (
+        OUTER_N_SPLITS * OUTER_N_REPEATS
+    )
+
+    print(f"実験名: {experiment_name}")
+    print(f"被験者数: {len(X_all)}")
+    print(f"全特徴量数: {feature_count}")
     print(
-        f"実験名: {experiment_name}"
+        "外側CV: "
+        f"{OUTER_N_SPLITS}-fold × "
+        f"{OUTER_N_REPEATS}反復 "
+        f"= {total_outer_splits}回"
     )
     print(
-        f"被験者数: {len(X_all)}"
+        "各outer splitで TRAIN約80%だけを使ってGAを実行し、"
+        "TEST約20%は特徴量決定後に1回だけ評価します。"
     )
-    print(
-        f"GA用学習データ数: {len(X_train)}"
-    )
-    print(
-        f"最終テストデータ数: {len(X_test)}"
-    )
-    print(
-        f"テスト割合: {test_size}"
-    )
-    print(
-        f"テスト分割seed: {test_split_seed}"
-    )
-    print(
-        "※最終テストデータはGA終了まで使用しません。"
-    )
-    print(
-        f"全特徴量数: {feature_count}"
-    )
-    print(
-        f"個体数: {population_size}"
-    )
-    print(
-        f"世代数: {generations}"
-    )
-    print(
-        f"交叉率: {crossover_rate}"
-    )
-    print(
-        f"突然変異率: {mutation_rate}"
-    )
-    print(
-        f"エリート数: {elite_size}"
-    )
+    print(f"個体数: {population_size}")
+    print(f"世代数: {generations}")
+    print(f"交叉率: {crossover_rate}")
+    print(f"突然変異率: {mutation_rate}")
+    print(f"エリート数: {elite_size}")
     print(
         "特徴量数制約: "
         f"{min_features}～{max_features}"
     )
 
-    population = initialize_population(
-        population_size=population_size,
-        feature_count=feature_count,
-        min_features=min_features,
-        max_features=max_features,
-        rng=rng,
-    )
+    outer_result_rows: list[dict] = []
+    feature_set_frames: list[pd.DataFrame] = []
+    prediction_frames: list[pd.DataFrame] = []
 
-    fitness_cache: dict[
-        tuple[int, ...],
-        float
-    ] = {}
-
-    generation_history: list[dict] = []
-    individual_history: list[dict] = []
-
-    global_best_chromosome: (
-        np.ndarray | None
-    ) = None
-
-    global_best_fitness = float("-inf")
-
-    for generation in range(
-        1,
-        generations + 1,
+    for split_number, (
+        train_indexes,
+        test_indexes,
+    ) in enumerate(
+        outer_cv.split(X_all, y_all),
+        start=1,
     ):
+        repeat_number, fold_number = (
+            get_outer_repeat_and_fold(split_number)
+        )
+
         print(
-            f"\n===== Generation "
-            f"{generation}/{generations} ====="
+            "\n"
+            + "=" * 70
+        )
+        print(
+            f"OUTER Repeat {repeat_number}/{OUTER_N_REPEATS}, "
+            f"Fold {fold_number}/{OUTER_N_SPLITS} "
+            f"({split_number}/{total_outer_splits})"
+        )
+        print("=" * 70)
+
+        X_train = (
+            X_all.iloc[train_indexes]
+            .reset_index(drop=True)
+        )
+        X_test = (
+            X_all.iloc[test_indexes]
+            .reset_index(drop=True)
+        )
+        y_train = (
+            y_all.iloc[train_indexes]
+            .reset_index(drop=True)
+        )
+        y_test = (
+            y_all.iloc[test_indexes]
+            .reset_index(drop=True)
         )
 
-        fitnesses: list[float] = []
-
-        for individual_index, chromosome in enumerate(
-            population,
-            start=1,
-        ):
-            fitness = evaluate_chromosome(
-                chromosome=chromosome,
-                all_features=all_features,
-                X_all=X_train,
-                y=y_train,
-                config=config,
-                fitness_cache=fitness_cache,
-            )
-
-            fitnesses.append(fitness)
-
-            selected_features = (
-                chromosome_to_features(
-                    chromosome,
-                    all_features,
-                )
-            )
-
-            individual_history.append({
-                "generation": generation,
-                "individual": individual_index,
-                "fitness_auc": fitness,
-                "feature_count": len(
-                    selected_features
-                ),
-                "features": ",".join(
-                    selected_features
-                ),
-                "chromosome": "".join(
-                    str(int(gene))
-                    for gene in chromosome
-                ),
-            })
-
-            print(
-                f"Individual "
-                f"{individual_index:02d}: "
-                f"AUC={fitness:.6f}, "
-                f"features="
-                f"{len(selected_features)}"
-            )
-
-        finite_fitnesses = [
-            value
-            for value in fitnesses
-            if np.isfinite(value)
-        ]
-
-        if not finite_fitnesses:
-            raise RuntimeError(
-                "全個体の評価に失敗しました。"
-            )
-
-        best_index = int(
-            np.argmax(fitnesses)
+        print(
+            f"outer TRAIN: {len(X_train)}件 / "
+            f"outer TEST: {len(X_test)}件"
         )
 
-        generation_best_fitness = float(
-            fitnesses[best_index]
+        fold_output_dir = (
+            output_dir
+            / f"repeat_{repeat_number:02d}"
+            / f"fold_{fold_number:02d}"
+        )
+        fold_output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
         )
 
-        generation_best_chromosome = (
-            population[best_index].copy()
+        # 各outer splitでGAを独立実行する。
+        # splitごとにseedをずらして、GA探索も独立させる。
+        fold_ga_seed = (
+            random_seed + split_number - 1
         )
 
-        generation_best_features = (
-            chromosome_to_features(
-                generation_best_chromosome,
-                all_features,
-            )
+        (
+            best_features,
+            ga_cv_best_auc,
+            _best_chromosome,
+            _best_cv_result_path,
+            _ga_summary_path,
+        ) = run_ga_on_outer_train(
+            X_train=X_train,
+            y_train=y_train,
+            config=config,
+            all_features=all_features,
+            output_dir=fold_output_dir,
+            population_size=population_size,
+            generations=generations,
+            crossover_rate=crossover_rate,
+            mutation_rate=mutation_rate,
+            elite_size=elite_size,
+            tournament_size=tournament_size,
+            min_features=min_features,
+            max_features=max_features,
+            random_seed=fold_ga_seed,
         )
 
-        generation_mean = float(
-            np.mean(finite_fitnesses)
+        (
+            outer_test_auc,
+            predictions,
+            feature_importance,
+        ) = evaluate_outer_test_once(
+            X_train=X_train,
+            y_train=y_train,
+            X_test=X_test,
+            y_test=y_test,
+            best_features=best_features,
+            test_indexes=test_indexes,
         )
 
-        generation_std = float(
-            np.std(
-                finite_fitnesses,
-                ddof=0,
-            )
+        predictions.insert(
+            0,
+            "outer_split",
+            split_number,
+        )
+        predictions.insert(
+            0,
+            "outer_fold",
+            fold_number,
+        )
+        predictions.insert(
+            0,
+            "outer_repeat",
+            repeat_number,
+        )
+        prediction_frames.append(predictions)
+
+        save_outer_fold_result(
+            output_dir=fold_output_dir,
+            repeat_number=repeat_number,
+            fold_number=fold_number,
+            train_indexes=train_indexes,
+            test_indexes=test_indexes,
+            ga_cv_best_auc=ga_cv_best_auc,
+            outer_test_auc=outer_test_auc,
+            best_features=best_features,
+            predictions=predictions,
+            feature_importance=feature_importance,
         )
 
-        if (
-            generation_best_fitness
-            > global_best_fitness
-        ):
-            global_best_fitness = (
-                generation_best_fitness
-            )
-
-            global_best_chromosome = (
-                generation_best_chromosome.copy()
-            )
-
-        generation_history.append({
-            "generation": generation,
-            "best_auc": generation_best_fitness,
-            "mean_auc": generation_mean,
-            "std_auc": generation_std,
-            "best_feature_count": len(
-                generation_best_features
-            ),
-            "best_features": ",".join(
-                generation_best_features
-            ),
-            "unique_evaluated_total": len(
-                fitness_cache
-            ),
-            "global_best_auc": (
-                global_best_fitness
-            ),
+        outer_result_rows.append({
+            "outer_repeat": repeat_number,
+            "outer_fold": fold_number,
+            "outer_split": split_number,
+            "ga_seed": fold_ga_seed,
+            "train_count": len(train_indexes),
+            "test_count": len(test_indexes),
+            "ga_cv_best_auc": ga_cv_best_auc,
+            "outer_test_auc": outer_test_auc,
+            "feature_count": len(best_features),
+            "features": ",".join(best_features),
         })
 
-        print(
-            "世代最良 AUC: "
-            f"{generation_best_fitness:.6f}"
-        )
-        print(
-            "世代平均 AUC: "
-            f"{generation_mean:.6f} "
-            f"± {generation_std:.6f}"
-        )
-        print(
-            "世代最良特徴量数: "
-            f"{len(generation_best_features)}"
-        )
-        print(
-            "全世代最良 AUC: "
-            f"{global_best_fitness:.6f}"
-        )
-        print(
-            "評価済みユニーク個体数: "
-            f"{len(fitness_cache)}"
+        feature_set_frames.append(
+            pd.DataFrame({
+                "outer_repeat": repeat_number,
+                "outer_fold": fold_number,
+                "outer_split": split_number,
+                "feature": best_features,
+            })
         )
 
-        if generation == generations:
-            break
-
-        sorted_indexes = sorted(
-            range(len(population)),
-            key=lambda i: fitnesses[i],
-            reverse=True,
+        print("\n  ----- outer TEST評価 -----")
+        print(
+            f"  GA CV 最良AUC: {ga_cv_best_auc:.6f}"
+        )
+        print(
+            f"  outer TEST AUC: {outer_test_auc:.6f}"
+        )
+        print(
+            f"  選択特徴量数: {len(best_features)}"
         )
 
-        next_population: list[
-            np.ndarray
-        ] = [
-            population[i].copy()
-            for i in sorted_indexes[
-                :elite_size
-            ]
+    outer_results = pd.DataFrame(
+        outer_result_rows
+    )
+    feature_sets = pd.concat(
+        feature_set_frames,
+        ignore_index=True,
+    )
+    all_predictions = pd.concat(
+        prediction_frames,
+        ignore_index=True,
+    )
+
+    feature_frequency = (
+        create_feature_selection_frequency(
+            feature_sets=feature_sets,
+            all_features=all_features,
+            total_outer_splits=total_outer_splits,
+        )
+    )
+
+    # 50個のfold AUCの集計
+    fold_auc_summary = pd.DataFrame([{
+        "outer_fold_auc_mean": (
+            outer_results["outer_test_auc"].mean()
+        ),
+        "outer_fold_auc_std": (
+            outer_results["outer_test_auc"].std()
+        ),
+        "outer_fold_auc_min": (
+            outer_results["outer_test_auc"].min()
+        ),
+        "outer_fold_auc_max": (
+            outer_results["outer_test_auc"].max()
+        ),
+        "outer_fold_auc_median": (
+            outer_results["outer_test_auc"].median()
+        ),
+        "ga_cv_best_auc_mean": (
+            outer_results["ga_cv_best_auc"].mean()
+        ),
+        "selected_feature_count_mean": (
+            outer_results["feature_count"].mean()
+        ),
+        "selected_feature_count_std": (
+            outer_results["feature_count"].std()
+        ),
+        "outer_splits": total_outer_splits,
+        "outer_n_splits": OUTER_N_SPLITS,
+        "outer_n_repeats": OUTER_N_REPEATS,
+        "outer_random_state": outer_random_state,
+    }])
+
+    # 各repeatについて5fold分のOOF予測をまとめたAUCを算出する。
+    repeat_rows = []
+
+    for repeat_number in range(
+        1,
+        OUTER_N_REPEATS + 1,
+    ):
+        repeat_predictions = all_predictions[
+            all_predictions["outer_repeat"]
+            == repeat_number
         ]
 
-        while (
-            len(next_population)
-            < population_size
-        ):
-            parent1 = tournament_selection(
-                population=population,
-                fitnesses=fitnesses,
-                tournament_size=tournament_size,
-                rng=rng,
+        repeat_auc = float(
+            roc_auc_score(
+                repeat_predictions["actual"],
+                repeat_predictions[
+                    "probability_positive"
+                ],
             )
-
-            parent2 = tournament_selection(
-                population=population,
-                fitnesses=fitnesses,
-                tournament_size=tournament_size,
-                rng=rng,
-            )
-
-            child1, child2 = (
-                uniform_crossover(
-                    parent1=parent1,
-                    parent2=parent2,
-                    crossover_rate=crossover_rate,
-                    rng=rng,
-                )
-            )
-
-            child1 = mutate(
-                child1,
-                mutation_rate,
-                rng,
-            )
-
-            child2 = mutate(
-                child2,
-                mutation_rate,
-                rng,
-            )
-
-            child1 = repair_chromosome(
-                child1,
-                min_features=min_features,
-                max_features=max_features,
-                rng=rng,
-            )
-
-            child2 = repair_chromosome(
-                child2,
-                min_features=min_features,
-                max_features=max_features,
-                rng=rng,
-            )
-
-            next_population.append(
-                child1
-            )
-
-            if (
-                len(next_population)
-                < population_size
-            ):
-                next_population.append(
-                    child2
-                )
-
-        population = next_population
-
-    if global_best_chromosome is None:
-        raise RuntimeError(
-            "最良個体を取得できませんでした。"
         )
 
-    best_features = (
-        chromosome_to_features(
-            global_best_chromosome,
-            all_features,
+        repeat_rows.append({
+            "outer_repeat": repeat_number,
+            "oof_auc": repeat_auc,
+        })
+
+    repeat_auc_df = pd.DataFrame(
+        repeat_rows
+    )
+
+    repeat_auc_summary = pd.DataFrame([{
+        "repeat_oof_auc_mean": (
+            repeat_auc_df["oof_auc"].mean()
+        ),
+        "repeat_oof_auc_std": (
+            repeat_auc_df["oof_auc"].std()
+        ),
+        "repeat_oof_auc_min": (
+            repeat_auc_df["oof_auc"].min()
+        ),
+        "repeat_oof_auc_max": (
+            repeat_auc_df["oof_auc"].max()
+        ),
+        "repeat_count": OUTER_N_REPEATS,
+    }])
+
+    summary_output_path = (
+        output_dir / "outer_cv_summary.xlsx"
+    )
+
+    with pd.ExcelWriter(
+        summary_output_path,
+        engine="openpyxl",
+    ) as writer:
+        fold_auc_summary.to_excel(
+            writer,
+            sheet_name="summary",
+            index=False,
         )
-    )
+        repeat_auc_summary.to_excel(
+            writer,
+            sheet_name="repeat_summary",
+            index=False,
+        )
+        repeat_auc_df.to_excel(
+            writer,
+            sheet_name="repeat_auc",
+            index=False,
+        )
+        outer_results.to_excel(
+            writer,
+            sheet_name="outer_fold_results",
+            index=False,
+        )
+        feature_sets.to_excel(
+            writer,
+            sheet_name="feature_sets",
+            index=False,
+        )
+        feature_frequency.to_excel(
+            writer,
+            sheet_name="feature_frequency",
+            index=False,
+        )
+        all_predictions.to_excel(
+            writer,
+            sheet_name="test_predictions",
+            index=False,
+        )
 
+    print("\n" + "=" * 70)
+    print("===== 外側5-fold × 10反復 最終結果 =====")
+    print("=" * 70)
     print(
-        "\n===== GAで決定した最良特徴量集合 ====="
-    )
-    print(
-        "GA CV 最良AUC: "
-        f"{global_best_fitness:.6f}"
-    )
-    print(
-        f"特徴量数: {len(best_features)}"
-    )
-    print(
-        "特徴量: "
-        + ", ".join(best_features)
-    )
-
-    best_config = copy.deepcopy(
-        config
-    )
-    best_config["features"] = (
-        best_features.copy()
-    )
-
-    # 最良特徴量集合のCV詳細も、GA用学習データだけで保存する。
-    # 最終テストデータはここでも使用しない。
-    X_best_train = X_train[
-        best_features
-    ].copy()
-
-    best_cv_evaluation = evaluate_lightgbm(
-        X_original=X_best_train,
-        y=y_train,
-        config=best_config,
-    )
-
-    best_cv_result_path = (
-        output_dir
-        / "best_cv_result.xlsx"
-    )
-
-    save_result(
-        output_path=best_cv_result_path,
-        config=best_config,
-        all_data=best_cv_evaluation[
-            "all_data"
-        ],
-        task_type=best_cv_evaluation[
-            "task_type"
-        ],
-        result_sheets=best_cv_evaluation[
-            "result_sheets"
-        ],
-        feature_importance=best_cv_evaluation[
-            "feature_importance"
-        ],
-    )
-
-    summary_path = save_ga_summary(
-        output_dir=output_dir,
-        generation_history=(
-            generation_history
-        ),
-        individual_history=(
-            individual_history
-        ),
-        best_features=best_features,
-        all_features=all_features,
-        best_chromosome=(
-            global_best_chromosome
-        ),
-        fitness_cache=fitness_cache,
-    )
-
-    print(
-        "\n===== 最終テスト評価 ====="
+        "50 foldのouter TEST AUC: "
+        f"{fold_auc_summary.iloc[0]['outer_fold_auc_mean']:.6f} "
+        "± "
+        f"{fold_auc_summary.iloc[0]['outer_fold_auc_std']:.6f}"
     )
     print(
-        "GAで一度も使用していないテストデータを、"
-        "ここで初めて使用します。"
+        "10 repeatのOOF AUC: "
+        f"{repeat_auc_summary.iloc[0]['repeat_oof_auc_mean']:.6f} "
+        "± "
+        f"{repeat_auc_summary.iloc[0]['repeat_oof_auc_std']:.6f}"
+    )
+    print(
+        "平均選択特徴量数: "
+        f"{fold_auc_summary.iloc[0]['selected_feature_count_mean']:.2f}"
+    )
+    print(
+        f"\n集計結果保存先: {summary_output_path}"
     )
 
-    (
-        final_test_result_path,
-        final_test_auc,
-    ) = evaluate_final_test_once(
-        X_train=X_train,
-        y_train=y_train,
-        X_test=X_test,
-        y_test=y_test,
-        best_features=best_features,
-        ga_cv_auc=global_best_fitness,
-        train_indexes=train_indexes,
-        test_indexes=test_indexes,
-        test_size=test_size,
-        split_seed=test_split_seed,
-        output_dir=output_dir,
-    )
-
-    print(
-        "GA CV 最良AUC: "
-        f"{global_best_fitness:.6f}"
-    )
-    print(
-        "最終TEST AUC: "
-        f"{final_test_auc:.6f}"
-    )
-    print(
-        f"\n最良特徴量のCV詳細: {best_cv_result_path}"
-    )
-    print(
-        f"GA集計結果: {summary_path}"
-    )
-    print(
-        f"最終テスト結果: {final_test_result_path}"
-    )
-
-    return summary_path
+    return summary_output_path
 
 
 def main() -> None:
@@ -1200,30 +1405,20 @@ def main() -> None:
     )
 
     parser.add_argument(
-        "--test-size",
-        type=float,
-        default=0.2,
-        help=(
-            "最終テストデータの割合。"
-            "デフォルトは0.2（8:2分割）"
-        ),
-    )
-
-    parser.add_argument(
-        "--test-split-seed",
-        type=int,
-        default=42,
-        help=(
-            "学習/最終テスト分割専用の乱数シード。"
-            "GAのseedとは独立"
-        ),
-    )
-
-    parser.add_argument(
         "--seed",
         type=int,
         default=42,
-        help="乱数シード",
+        help=(
+            "GAの基準乱数シード。"
+            "outer splitごとにこの値から1ずつ増加"
+        ),
+    )
+
+    parser.add_argument(
+        "--outer-seed",
+        type=int,
+        default=OUTER_RANDOM_STATE,
+        help="外側RepeatedStratifiedKFoldの乱数シード",
     )
 
     parser.add_argument(
@@ -1234,34 +1429,19 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    run_genetic_algorithm(
+    run_genetic_algorithm_repeated_cv(
         config_path=args.config,
         data_path=args.data,
-        population_size=(
-            args.population_size
-        ),
+        population_size=args.population_size,
         generations=args.generations,
-        crossover_rate=(
-            args.crossover_rate
-        ),
-        mutation_rate=(
-            args.mutation_rate
-        ),
+        crossover_rate=args.crossover_rate,
+        mutation_rate=args.mutation_rate,
         elite_size=args.elite_size,
-        tournament_size=(
-            args.tournament_size
-        ),
-        min_features=(
-            args.min_features
-        ),
-        max_features=(
-            args.max_features
-        ),
-        test_size=args.test_size,
-        test_split_seed=(
-            args.test_split_seed
-        ),
+        tournament_size=args.tournament_size,
+        min_features=args.min_features,
+        max_features=args.max_features,
         random_seed=args.seed,
+        outer_random_state=args.outer_seed,
         output_path=args.output,
     )
 

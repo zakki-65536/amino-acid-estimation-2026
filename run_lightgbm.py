@@ -39,6 +39,7 @@ RANDOM_STATE = 42
 
 THRESHOLD_SCORING = "balanced_accuracy"
 THRESHOLD_COUNT = 100
+DEFAULT_THRESHOLD = 0.5
 
 MODEL_PARAMS = {
   "n_estimators": 300,
@@ -143,7 +144,9 @@ def create_feature_importance_summary(
 def run_classification(
   X: pd.DataFrame,
   y: pd.Series,
-  feature_name_map: dict[str, str]
+  feature_name_map: dict[str, str],
+  skip_threshold_cv: bool = False,
+  default_threshold: float = DEFAULT_THRESHOLD
 ) -> tuple[
   dict[str, pd.DataFrame],
   pd.DataFrame
@@ -179,39 +182,63 @@ def run_classification(
     y_test = y.iloc[test_index]
 
     if is_binary:
-      inner_cv = StratifiedKFold(
-        n_splits=INNER_N_SPLITS,
-        shuffle=True,
-        random_state=RANDOM_STATE + split_number
-      )
-
       base_model = LGBMClassifier(
         **MODEL_PARAMS
       )
 
-      model = TunedThresholdClassifierCV(
-        estimator=base_model,
-        scoring=THRESHOLD_SCORING,
-        response_method="predict_proba",
-        thresholds=THRESHOLD_COUNT,
-        cv=inner_cv,
-        refit=True,
-        n_jobs=1,
-        store_cv_results=True
-      )
+      if skip_threshold_cv:
+        model = base_model
 
-      model.fit(
-        X_train,
-        y_train
-      )
+        model.fit(
+          X_train,
+          y_train
+        )
 
-      predicted = model.predict(X_test)
-      probabilities = model.predict_proba(X_test)
+        probabilities = model.predict_proba(X_test)
 
-      fitted_lightgbm = model.estimator_
+        negative_label = model.classes_[0]
+        positive_label = model.classes_[1]
 
-      selected_threshold = model.best_threshold_
-      inner_best_score = model.best_score_
+        predicted = np.where(
+          probabilities[:, 1] >= default_threshold,
+          positive_label,
+          negative_label
+        )
+
+        fitted_lightgbm = model
+        selected_threshold = default_threshold
+        inner_best_score = np.nan
+
+      else:
+        inner_cv = StratifiedKFold(
+          n_splits=INNER_N_SPLITS,
+          shuffle=True,
+          random_state=RANDOM_STATE + split_number
+        )
+
+        model = TunedThresholdClassifierCV(
+          estimator=base_model,
+          scoring=THRESHOLD_SCORING,
+          response_method="predict_proba",
+          thresholds=THRESHOLD_COUNT,
+          cv=inner_cv,
+          refit=True,
+          n_jobs=1,
+          store_cv_results=True
+        )
+
+        model.fit(
+          X_train,
+          y_train
+        )
+
+        predicted = model.predict(X_test)
+        probabilities = model.predict_proba(X_test)
+
+        fitted_lightgbm = model.estimator_
+
+        selected_threshold = model.best_threshold_
+        inner_best_score = model.best_score_
 
     else:
       model = LGBMClassifier(
@@ -353,7 +380,7 @@ def run_classification(
       })
     )
 
-    if is_binary:
+    if is_binary and not skip_threshold_cv:
       threshold_curve_frames.append(
         pd.DataFrame({
           "repeat": repeat_number,
@@ -481,7 +508,16 @@ def run_classification(
 
     result_sheets["threshold_summary"] = (
       pd.DataFrame([{
-        "scoring": THRESHOLD_SCORING,
+        "mode": (
+          "fixed"
+          if skip_threshold_cv
+          else "cv_optimized"
+        ),
+        "scoring": (
+          "fixed_threshold"
+          if skip_threshold_cv
+          else THRESHOLD_SCORING
+        ),
         "mean": thresholds.mean(),
         "std": thresholds.std(),
         "min": thresholds.min(),
@@ -490,12 +526,13 @@ def run_classification(
       }])
     )
 
-    result_sheets["threshold_curves"] = (
-      pd.concat(
-        threshold_curve_frames,
-        ignore_index=True
+    if not skip_threshold_cv:
+      result_sheets["threshold_curves"] = (
+        pd.concat(
+          threshold_curve_frames,
+          ignore_index=True
+        )
       )
-    )
 
   return result_sheets, feature_importance
 
@@ -654,56 +691,6 @@ def create_all_data(
 
   return all_data
 
-def evaluate_lightgbm(
-  X_original: pd.DataFrame,
-  y: pd.Series,
-  config: dict
-) -> dict:
-  target_config = config["target"]
-
-  all_data = create_all_data(
-    X=X_original,
-    y=y,
-    target_id=str(target_config["id"])
-  )
-
-  X, feature_name_map = rename_features_for_lightgbm(
-    X_original
-  )
-
-  is_classification = (
-    target_config.get("ratios") is not None
-    or target_config.get("cutoffs") is not None
-  )
-
-  if is_classification:
-    result_sheets, feature_importance = (
-      run_classification(
-        X=X,
-        y=y,
-        feature_name_map=feature_name_map
-      )
-    )
-
-    task_type = "classification"
-
-  else:
-    result_sheets, feature_importance = (
-      run_regression(
-        X=X,
-        y=y,
-        feature_name_map=feature_name_map
-      )
-    )
-
-    task_type = "regression"
-
-  return {
-    "task_type": task_type,
-    "all_data": all_data,
-    "result_sheets": result_sheets,
-    "feature_importance": feature_importance,
-  }
 
 def save_result(
   output_path: Path,
@@ -790,9 +777,164 @@ def save_result(
     )
 
 
+def evaluate_lightgbm(
+  X_original: pd.DataFrame,
+  y: pd.Series,
+  config: dict,
+  skip_threshold_cv: bool = False,
+  default_threshold: float = DEFAULT_THRESHOLD
+) -> dict:
+  if not 0.0 <= default_threshold <= 1.0:
+    raise ValueError(
+      "default_threshold は0～1にしてください。"
+    )
+
+  target_config = config["target"]
+
+  all_data = create_all_data(
+    X=X_original,
+    y=y,
+    target_id=str(target_config["id"])
+  )
+
+  X, feature_name_map = rename_features_for_lightgbm(
+    X_original
+  )
+
+  is_classification = (
+    target_config.get("ratios") is not None
+    or target_config.get("cutoffs") is not None
+  )
+
+  if is_classification:
+    result_sheets, feature_importance = (
+      run_classification(
+        X=X,
+        y=y,
+        feature_name_map=feature_name_map,
+        skip_threshold_cv=skip_threshold_cv,
+        default_threshold=default_threshold
+      )
+    )
+
+    task_type = "classification"
+
+  else:
+    result_sheets, feature_importance = (
+      run_regression(
+        X=X,
+        y=y,
+        feature_name_map=feature_name_map
+      )
+    )
+
+    task_type = "regression"
+
+  return {
+    "all_data": all_data,
+    "task_type": task_type,
+    "result_sheets": result_sheets,
+    "feature_importance": feature_importance,
+  }
+
+
+def evaluate_lightgbm_holdout(
+  X_train_original: pd.DataFrame,
+  y_train: pd.Series,
+  X_test_original: pd.DataFrame,
+  y_test: pd.Series,
+  default_threshold: float = DEFAULT_THRESHOLD
+) -> dict:
+  """
+  学習データ全体でLightGBMを1回学習し、
+  独立テストデータを1回だけ評価する。
+
+  二値分類専用。AUCはpredict_probaから計算し、
+  0/1分類は default_threshold（既定0.5）で行う。
+  """
+  if not 0.0 <= default_threshold <= 1.0:
+    raise ValueError(
+      "default_threshold は0～1にしてください。"
+    )
+
+  if y_train.nunique() != 2:
+    raise ValueError(
+      "evaluate_lightgbm_holdout は二値分類を前提としています。"
+    )
+
+  X_train, feature_name_map = rename_features_for_lightgbm(
+    X_train_original
+  )
+
+  X_test = X_test_original.copy()
+  X_test.columns = X_train.columns
+
+  model = LGBMClassifier(
+    **MODEL_PARAMS
+  )
+
+  model.fit(
+    X_train,
+    y_train
+  )
+
+  probabilities = model.predict_proba(X_test)
+
+  if len(model.classes_) != 2:
+    raise ValueError(
+      "テスト評価時の学習データが二値分類になっていません。"
+    )
+
+  negative_label = model.classes_[0]
+  positive_label = model.classes_[1]
+  positive_probabilities = probabilities[:, 1]
+
+  predicted = np.where(
+    positive_probabilities >= default_threshold,
+    positive_label,
+    negative_label
+  )
+
+  roc_auc = float(
+    roc_auc_score(
+      y_test,
+      positive_probabilities
+    )
+  )
+
+  predictions = pd.DataFrame({
+    "actual": y_test.to_numpy(),
+    "predicted": predicted,
+    "selected_threshold": default_threshold,
+    "positive_label": positive_label,
+    "probability_positive": positive_probabilities,
+  })
+
+  feature_importance = pd.DataFrame({
+    "feature": [
+      feature_name_map[name]
+      for name in model.feature_name_
+    ],
+    "importance": model.feature_importances_,
+  }).sort_values(
+    ["importance", "feature"],
+    ascending=[False, True]
+  ).reset_index(drop=True)
+
+  return {
+    "roc_auc": roc_auc,
+    "predictions": predictions,
+    "feature_importance": feature_importance,
+    "selected_threshold": default_threshold,
+    "positive_label": positive_label,
+  }
+
+
 def run_lightgbm(
   config_path: str | Path,
-  data_path: str | Path | None = None
+  data_path: str | Path | None = None,
+  skip_threshold_cv: bool = False,
+  default_threshold: float = DEFAULT_THRESHOLD
 ) -> Path:
   if data_path is None:
     X_original, y, config = filter_data(
@@ -807,15 +949,16 @@ def run_lightgbm(
   evaluation = evaluate_lightgbm(
     X_original=X_original,
     y=y,
-    config=config
+    config=config,
+    skip_threshold_cv=skip_threshold_cv,
+    default_threshold=default_threshold
   )
 
-  task_type = evaluation["task_type"]
   all_data = evaluation["all_data"]
+  task_type = evaluation["task_type"]
   result_sheets = evaluation["result_sheets"]
-  feature_importance = evaluation[
-    "feature_importance"
-  ]
+  feature_importance = evaluation["feature_importance"]
+  X = X_original
 
   experiment_name = config[
     "experiment_name"
@@ -837,11 +980,22 @@ def run_lightgbm(
 
   print(f"実験名: {experiment_name}")
   print(f"処理: {task_type}")
-  print(f"被験者数: {len(X_original)}")
-  print(f"説明変数数: {X_original.shape[1]}")
+  print(f"被験者数: {len(X)}")
+  print(f"説明変数数: {X.shape[1]}")
   print(f"分割数: {N_SPLITS}")
   print(f"反復回数: {N_REPEATS}")
   print(f"学習回数: {N_SPLITS * N_REPEATS}")
+  if task_type == "classification" and y.nunique() == 2:
+    if skip_threshold_cv:
+      print(
+        "閾値決定CV: 省略 "
+        f"(固定閾値={default_threshold})"
+      )
+    else:
+      print(
+        "閾値決定CV: 実行 "
+        f"({THRESHOLD_SCORING})"
+      )
 
   print("\n評価指標:")
   print(
@@ -851,7 +1005,7 @@ def run_lightgbm(
   )
 
   print(f"\n保存先: {output_path}")
-
+  
   if "threshold_summary" in result_sheets:
     threshold_summary = result_sheets[
       "threshold_summary"
@@ -884,11 +1038,29 @@ def main() -> None:
     help="元データのExcelファイル"
   )
 
+  parser.add_argument(
+    "--skip-threshold-cv",
+    action="store_true",
+    help=(
+      "二値分類で閾値決定用CVを省略し、"
+      "固定閾値を使用する"
+    )
+  )
+
+  parser.add_argument(
+    "--default-threshold",
+    type=float,
+    default=DEFAULT_THRESHOLD,
+    help="閾値CVを省略した場合の固定閾値（既定: 0.5）"
+  )
+
   args = parser.parse_args()
 
   run_lightgbm(
     config_path=args.config,
-    data_path=args.data
+    data_path=args.data,
+    skip_threshold_cv=args.skip_threshold_cv,
+    default_threshold=args.default_threshold
   )
 
 

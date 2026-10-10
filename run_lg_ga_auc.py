@@ -3,18 +3,19 @@ from __future__ import annotations
 import argparse
 import copy
 import random
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from lightgbm import LGBMClassifier
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import RepeatedStratifiedKFold
 
 from filter import filter_data
 from run_lightgbm import (
-    MODEL_PARAMS,
+    DEFAULT_THRESHOLD,
     evaluate_lightgbm,
+    evaluate_lightgbm_holdout,
     save_result,
 )
 
@@ -26,6 +27,10 @@ RESULT_DIR = BASE_DIR / "result"
 OUTER_N_SPLITS = 5
 OUTER_N_REPEATS = 10
 OUTER_RANDOM_STATE = 42
+
+
+def current_timestamp() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 
 def get_metric(
@@ -163,6 +168,7 @@ def evaluate_chromosome(
     y_train: pd.Series,
     config: dict,
     fitness_cache: dict[tuple[int, ...], float],
+    skip_threshold_cv: bool,
 ) -> float:
     """
     outer TRAINだけを使って候補特徴量集合をCV評価し、
@@ -196,8 +202,9 @@ def evaluate_chromosome(
             X_original=X_current,
             y=y_train,
             config=current_config,
+            skip_threshold_cv=skip_threshold_cv,
+            default_threshold=DEFAULT_THRESHOLD,
         )
-
         summary_metrics = evaluation[
             "result_sheets"
         ]["summary_metrics"]
@@ -403,6 +410,7 @@ def run_ga_on_outer_train(
     min_features: int,
     max_features: int,
     random_seed: int,
+    skip_threshold_cv: bool,
 ) -> tuple[
     list[str],
     float,
@@ -461,6 +469,7 @@ def run_ga_on_outer_train(
                 y_train=y_train,
                 config=config,
                 fitness_cache=fitness_cache,
+                skip_threshold_cv=skip_threshold_cv,
             )
 
             fitnesses.append(fitness)
@@ -638,14 +647,16 @@ def run_ga_on_outer_train(
         best_features
     ].copy()
 
+    best_cv_result_path = (
+        output_dir / "best_cv_result.xlsx"
+    )
+
     best_cv_evaluation = evaluate_lightgbm(
         X_original=X_best_train,
         y=y_train,
         config=best_config,
-    )
-
-    best_cv_result_path = (
-        output_dir / "best_cv_result.xlsx"
+        skip_threshold_cv=skip_threshold_cv,
+        default_threshold=DEFAULT_THRESHOLD,
     )
 
     save_result(
@@ -692,63 +703,27 @@ def evaluate_outer_test_once(
 ]:
     """
     GA終了後、固定した最良特徴量集合でouter TESTを1回だけ評価する。
+    LightGBMの学習・予測は run_lightgbm.py 側で実行する。
     """
-    X_train_best = X_train[best_features].copy()
-    X_test_best = X_test[best_features].copy()
-
-    safe_names = [
-        f"feature_{index}"
-        for index in range(len(best_features))
-    ]
-    X_train_best.columns = safe_names
-    X_test_best.columns = safe_names
-
-    model = LGBMClassifier(
-        **MODEL_PARAMS
-    )
-    model.fit(
-        X_train_best,
-        y_train,
+    evaluation = evaluate_lightgbm_holdout(
+        X_train_original=X_train[best_features].copy(),
+        y_train=y_train,
+        X_test_original=X_test[best_features].copy(),
+        y_test=y_test,
+        default_threshold=DEFAULT_THRESHOLD,
     )
 
-    probabilities = model.predict_proba(
-        X_test_best
+    predictions = evaluation["predictions"].copy()
+    predictions.insert(
+        0,
+        "filtered_row",
+        test_indexes + 1,
     )
-
-    if len(model.classes_) != 2:
-        raise ValueError(
-            "outer TESTのAUC評価は二値分類を前提としています。"
-        )
-
-    positive_label = model.classes_[1]
-    positive_probabilities = probabilities[:, 1]
-
-    test_auc = float(
-        roc_auc_score(
-            y_test,
-            positive_probabilities,
-        )
-    )
-
-    predictions = pd.DataFrame({
-        "filtered_row": test_indexes + 1,
-        "actual": y_test.to_numpy(),
-        "positive_label": positive_label,
-        "probability_positive": positive_probabilities,
-    })
-
-    feature_importance = pd.DataFrame({
-        "feature": best_features,
-        "importance": model.feature_importances_,
-    }).sort_values(
-        ["importance", "feature"],
-        ascending=[False, True],
-    ).reset_index(drop=True)
 
     return (
-        test_auc,
+        float(evaluation["roc_auc"]),
         predictions,
-        feature_importance,
+        evaluation["feature_importance"].copy(),
     )
 
 
@@ -872,6 +847,7 @@ def run_genetic_algorithm_repeated_cv(
     random_seed: int = 42,
     outer_random_state: int = OUTER_RANDOM_STATE,
     output_path: str | Path | None = None,
+    skip_threshold_cv: bool = False,
 ) -> Path:
     if data_path is None:
         X_all, y_all, config = filter_data(
@@ -989,6 +965,14 @@ def run_genetic_algorithm_repeated_cv(
     )
     print(f"個体数: {population_size}")
     print(f"世代数: {generations}")
+    print(
+        "GA内部の閾値決定CV: "
+        + (
+            f"省略（固定閾値={DEFAULT_THRESHOLD}、AUCはpredict_proba）"
+            if skip_threshold_cv
+            else "実行（従来どおり）"
+        )
+    )
     print(f"交叉率: {crossover_rate}")
     print(f"突然変異率: {mutation_rate}")
     print(f"エリート数: {elite_size}")
@@ -1017,6 +1001,7 @@ def run_genetic_algorithm_repeated_cv(
             + "=" * 70
         )
         print(
+            f"[{current_timestamp()}] "
             f"OUTER Repeat {repeat_number}/{OUTER_N_REPEATS}, "
             f"Fold {fold_number}/{OUTER_N_SPLITS} "
             f"({split_number}/{total_outer_splits})"
@@ -1082,6 +1067,7 @@ def run_genetic_algorithm_repeated_cv(
             min_features=min_features,
             max_features=max_features,
             random_seed=fold_ga_seed,
+            skip_threshold_cv=skip_threshold_cv,
         )
 
         (
@@ -1132,6 +1118,7 @@ def run_genetic_algorithm_repeated_cv(
             "outer_fold": fold_number,
             "outer_split": split_number,
             "ga_seed": fold_ga_seed,
+            "skip_threshold_cv": skip_threshold_cv,
             "train_count": len(train_indexes),
             "test_count": len(test_indexes),
             "ga_cv_best_auc": ga_cv_best_auc,
@@ -1210,6 +1197,7 @@ def run_genetic_algorithm_repeated_cv(
         "outer_n_splits": OUTER_N_SPLITS,
         "outer_n_repeats": OUTER_N_REPEATS,
         "outer_random_state": outer_random_state,
+        "skip_threshold_cv": skip_threshold_cv,
     }])
 
     # 各repeatについて5fold分のOOF予測をまとめたAUCを算出する。
@@ -1422,6 +1410,16 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--skip-threshold-cv",
+        action="store_true",
+        help=(
+            "GA内部のAUC評価で閾値決定用CVを省略する。"
+            "run_lightgbm.py 側で固定閾値0.5を使用し、"
+            "AUCはpredict_probaから計算する。"
+        ),
+    )
+
+    parser.add_argument(
         "--output",
         default=None,
         help="結果保存ディレクトリ",
@@ -1443,6 +1441,7 @@ def main() -> None:
         random_seed=args.seed,
         outer_random_state=args.outer_seed,
         output_path=args.output,
+        skip_threshold_cv=args.skip_threshold_cv,
     )
 
 

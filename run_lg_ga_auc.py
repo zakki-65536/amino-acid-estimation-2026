@@ -403,6 +403,7 @@ def run_ga_on_outer_train(
     output_dir: Path,
     population_size: int,
     generations: int,
+    early_stopping_rounds: int,
     crossover_rate: float,
     mutation_rate: float,
     elite_size: int,
@@ -446,6 +447,7 @@ def run_ga_on_outer_train(
 
     global_best_chromosome: np.ndarray | None = None
     global_best_fitness = float("-inf")
+    no_improvement_generations = 0
 
     for generation in range(
         1,
@@ -527,11 +529,18 @@ def run_ga_on_outer_train(
             np.std(finite_fitnesses, ddof=0)
         )
 
-        if generation_best_fitness > global_best_fitness:
+        improved = (
+            generation_best_fitness > global_best_fitness
+        )
+
+        if improved:
             global_best_fitness = generation_best_fitness
             global_best_chromosome = (
                 generation_best_chromosome.copy()
             )
+            no_improvement_generations = 0
+        else:
+            no_improvement_generations += 1
 
         generation_history.append({
             "generation": generation,
@@ -548,6 +557,10 @@ def run_ga_on_outer_train(
                 fitness_cache
             ),
             "global_best_auc": global_best_fitness,
+            "improved": improved,
+            "no_improvement_generations": (
+                no_improvement_generations
+            ),
         })
 
         print(
@@ -562,8 +575,28 @@ def run_ga_on_outer_train(
             "  全世代最良 AUC: "
             f"{global_best_fitness:.6f}"
         )
+        print(
+            "  改善なし世代数: "
+            f"{no_improvement_generations}/"
+            f"{early_stopping_rounds}"
+        )
+
+        if (
+            no_improvement_generations
+            >= early_stopping_rounds
+        ):
+            print(
+                "  早期終了: "
+                f"{early_stopping_rounds}世代連続で "
+                "最良AUCが改善しなかったため、"
+                f"Generation {generation} で終了します。"
+            )
+            break
 
         if generation == generations:
+            print(
+                "  最大世代数に到達したため終了します。"
+            )
             break
 
         sorted_indexes = sorted(
@@ -837,7 +870,8 @@ def run_genetic_algorithm_repeated_cv(
     config_path: str | Path,
     data_path: str | Path | None = None,
     population_size: int = 20,
-    generations: int = 20,
+    generations: int = 100,
+    early_stopping_rounds: int = 10,
     crossover_rate: float = 0.8,
     mutation_rate: float | None = None,
     elite_size: int = 2,
@@ -909,6 +943,11 @@ def run_genetic_algorithm_repeated_cv(
             "generations は1以上にしてください。"
         )
 
+    if early_stopping_rounds < 1:
+        raise ValueError(
+            "early_stopping_rounds は1以上にしてください。"
+        )
+
     if mutation_rate is None:
         mutation_rate = 1.0 / feature_count
 
@@ -964,7 +1003,11 @@ def run_genetic_algorithm_repeated_cv(
         "TEST約20%は特徴量決定後に1回だけ評価します。"
     )
     print(f"個体数: {population_size}")
-    print(f"世代数: {generations}")
+    print(f"最大世代数: {generations}")
+    print(
+        "早期終了条件: "
+        f"{early_stopping_rounds}世代連続で最良AUCの改善なし"
+    )
     print(
         "GA内部の閾値決定CV: "
         + (
@@ -1060,6 +1103,7 @@ def run_genetic_algorithm_repeated_cv(
             output_dir=fold_output_dir,
             population_size=population_size,
             generations=generations,
+            early_stopping_rounds=early_stopping_rounds,
             crossover_rate=crossover_rate,
             mutation_rate=mutation_rate,
             elite_size=elite_size,
@@ -1340,8 +1384,18 @@ def main() -> None:
     parser.add_argument(
         "--generations",
         type=int,
-        default=20,
-        help="世代数",
+        default=100,
+        help="最大世代数（デフォルト100）",
+    )
+
+    parser.add_argument(
+        "--early-stopping-rounds",
+        type=int,
+        default=10,
+        help=(
+            "最良AUCが改善しない状態が何世代続いたら"
+            "早期終了するか（デフォルト10）"
+        ),
     )
 
     parser.add_argument(
@@ -1432,6 +1486,7 @@ def main() -> None:
         data_path=args.data,
         population_size=args.population_size,
         generations=args.generations,
+        early_stopping_rounds=args.early_stopping_rounds,
         crossover_rate=args.crossover_rate,
         mutation_rate=args.mutation_rate,
         elite_size=args.elite_size,

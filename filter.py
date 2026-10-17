@@ -151,6 +151,86 @@ def apply_filters(
   return filtered.reset_index(drop=True)
 
 
+def compare_missing_ratio(
+  values: pd.Series,
+  operator: str,
+  ratio: float
+) -> pd.Series:
+  if operator == ">":
+    return values > ratio
+
+  if operator == ">=":
+    return values >= ratio
+
+  if operator == "<":
+    return values < ratio
+
+  if operator == "<=":
+    return values <= ratio
+
+
+def apply_missing_feature_filter(
+  data: pd.DataFrame,
+  config: dict,
+  feature_ids: list[str]
+) -> pd.DataFrame:
+  filter_config = config.get(
+    "missing_feature_filter"
+  )
+
+  if filter_config is None:
+    return data.reset_index(drop=True)
+
+  operator = str(
+    filter_config.get("operator", "")
+  ).strip()
+
+  if operator not in {
+    ">",
+    ">=",
+    "<",
+    "<="
+  }:
+    raise ValueError(
+      "missing_feature_filter.operatorは "
+      '\">\", ">=", "<", "<=" '
+      "のいずれかを指定してください。"
+    )
+
+  try:
+    ratio = float(
+      filter_config["ratio"]
+    )
+  except (KeyError, TypeError, ValueError):
+    raise ValueError(
+      "missing_feature_filter.ratioには"
+      "0以上1以下の数値を指定してください。"
+    )
+
+  if not 0.0 <= ratio <= 1.0:
+    raise ValueError(
+      "missing_feature_filter.ratioは"
+      "0以上1以下で指定してください。"
+    )
+
+  missing_ratios = (
+    data[feature_ids]
+    .isna()
+    .mean(axis=1)
+  )
+
+  drop_mask = compare_missing_ratio(
+    values=missing_ratios,
+    operator=operator,
+    ratio=ratio
+  )
+
+  return (
+    data.loc[~drop_mask]
+    .reset_index(drop=True)
+  )
+
+
 def filter_data(
   config_path: str | Path,
   data_path: str | Path = DEFAULT_DATA_PATH
@@ -173,6 +253,12 @@ def filter_data(
     normalize_item_id(item_id)
     for item_id in config["features"]
   ]
+
+  data = apply_missing_feature_filter(
+    data=data,
+    config=config,
+    feature_ids=feature_ids
+  )
 
   X = data[feature_ids].copy()
   y = data[target_id].copy()
@@ -227,6 +313,17 @@ def main() -> None:
   print(f"実験名: {config['experiment_name']}")
   print(f"被験者数: {len(X)}")
   print(f"説明変数数: {X.shape[1]}")
+  missing_filter = config.get(
+    "missing_feature_filter"
+  )
+
+  if missing_filter is None:
+    print("欠損率フィルタ: なし")
+  else:
+    print(
+      "欠損率フィルタ: "
+      f"(欠損率) {missing_filter.get('operator')} {missing_filter.get('ratio')}"
+    )
 
   target_config = config["target"]
 

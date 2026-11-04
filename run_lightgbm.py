@@ -55,6 +55,24 @@ MODEL_PARAMS = {
 }
 
 
+def resolve_model_params(
+  model_params: dict | None = None
+) -> dict:
+  """
+  デフォルトの MODEL_PARAMS を基準に、
+  呼び出し元から渡されたパラメータだけを上書きして返す。
+
+  MODEL_PARAMS 自体は変更しないため、
+  GAの並列個体評価でも個体間で設定が混ざらない。
+  """
+  params = MODEL_PARAMS.copy()
+
+  if model_params is not None:
+    params.update(model_params)
+
+  return params
+
+
 def rename_features_for_lightgbm(
   X: pd.DataFrame
 ) -> tuple[pd.DataFrame, dict[str, str]]:
@@ -76,14 +94,15 @@ def rename_features_for_lightgbm(
 
 
 def get_repeat_and_fold(
-  split_number: int
+  split_number: int,
+  n_splits: int = N_SPLITS
 ) -> tuple[int, int]:
   repeat_number = (
-    (split_number - 1) // N_SPLITS
+    (split_number - 1) // n_splits
   ) + 1
 
   fold_number = (
-    (split_number - 1) % N_SPLITS
+    (split_number - 1) % n_splits
   ) + 1
 
   return repeat_number, fold_number
@@ -146,14 +165,21 @@ def run_classification(
   y: pd.Series,
   feature_name_map: dict[str, str],
   skip_threshold_cv: bool = False,
-  default_threshold: float = DEFAULT_THRESHOLD
+  default_threshold: float = DEFAULT_THRESHOLD,
+  n_splits: int = N_SPLITS,
+  n_repeats: int = N_REPEATS,
+  model_params: dict | None = None
 ) -> tuple[
   dict[str, pd.DataFrame],
   pd.DataFrame
 ]:
+  effective_model_params = resolve_model_params(
+    model_params
+  )
+
   outer_cv = RepeatedStratifiedKFold(
-    n_splits=N_SPLITS,
-    n_repeats=N_REPEATS,
+    n_splits=n_splits,
+    n_repeats=n_repeats,
     random_state=RANDOM_STATE
   )
 
@@ -172,7 +198,8 @@ def run_classification(
     start=1
   ):
     repeat_number, fold_number = get_repeat_and_fold(
-      split_number
+      split_number,
+      n_splits=n_splits
     )
 
     X_train = X.iloc[train_index]
@@ -183,7 +210,7 @@ def run_classification(
 
     if is_binary:
       base_model = LGBMClassifier(
-        **MODEL_PARAMS
+        **effective_model_params
       )
 
       if skip_threshold_cv:
@@ -242,7 +269,7 @@ def run_classification(
 
     else:
       model = LGBMClassifier(
-        **MODEL_PARAMS
+        **effective_model_params
       )
 
       model.fit(
@@ -540,14 +567,21 @@ def run_classification(
 def run_regression(
   X: pd.DataFrame,
   y: pd.Series,
-  feature_name_map: dict[str, str]
+  feature_name_map: dict[str, str],
+  n_splits: int = N_SPLITS,
+  n_repeats: int = N_REPEATS,
+  model_params: dict | None = None
 ) -> tuple[
   dict[str, pd.DataFrame],
   pd.DataFrame
 ]:
+  effective_model_params = resolve_model_params(
+    model_params
+  )
+
   splitter = RepeatedKFold(
-    n_splits=N_SPLITS,
-    n_repeats=N_REPEATS,
+    n_splits=n_splits,
+    n_repeats=n_repeats,
     random_state=RANDOM_STATE
   )
 
@@ -563,7 +597,8 @@ def run_regression(
     start=1
   ):
     repeat_number, fold_number = get_repeat_and_fold(
-      split_number
+      split_number,
+      n_splits=n_splits
     )
 
     X_train = X.iloc[train_index]
@@ -573,7 +608,7 @@ def run_regression(
     y_test = y.iloc[test_index]
 
     model = LGBMRegressor(
-      **MODEL_PARAMS
+      **effective_model_params
     )
 
     model.fit(
@@ -698,7 +733,10 @@ def save_result(
   all_data: pd.DataFrame,
   task_type: str,
   result_sheets: dict[str, pd.DataFrame],
-  feature_importance: pd.DataFrame
+  feature_importance: pd.DataFrame,
+  n_splits: int = N_SPLITS,
+  n_repeats: int = N_REPEATS,
+  model_params: dict | None = None
 ) -> None:
   output_path.parent.mkdir(
     parents=True,
@@ -706,6 +744,10 @@ def save_result(
   )
 
   target_config = config["target"]
+
+  effective_model_params = resolve_model_params(
+    model_params
+  )
 
   run_info = pd.DataFrame({
     "item": [
@@ -736,12 +778,12 @@ def save_result(
       ),
       len(all_data),
       len(config["features"]),
-      N_SPLITS,
-      N_REPEATS,
-      N_SPLITS * N_REPEATS,
+      n_splits,
+      n_repeats,
+      n_splits * n_repeats,
       RANDOM_STATE,
       json.dumps(
-        MODEL_PARAMS,
+        effective_model_params,
         ensure_ascii=False
       ),
     ]
@@ -782,11 +824,24 @@ def evaluate_lightgbm(
   y: pd.Series,
   config: dict,
   skip_threshold_cv: bool = False,
-  default_threshold: float = DEFAULT_THRESHOLD
+  default_threshold: float = DEFAULT_THRESHOLD,
+  n_splits: int = N_SPLITS,
+  n_repeats: int = N_REPEATS,
+  model_params: dict | None = None
 ) -> dict:
   if not 0.0 <= default_threshold <= 1.0:
     raise ValueError(
       "default_threshold は0～1にしてください。"
+    )
+
+  if n_splits < 2:
+    raise ValueError(
+      "n_splits は2以上にしてください。"
+    )
+
+  if n_repeats < 1:
+    raise ValueError(
+      "n_repeats は1以上にしてください。"
     )
 
   target_config = config["target"]
@@ -813,7 +868,10 @@ def evaluate_lightgbm(
         y=y,
         feature_name_map=feature_name_map,
         skip_threshold_cv=skip_threshold_cv,
-        default_threshold=default_threshold
+        default_threshold=default_threshold,
+        n_splits=n_splits,
+        n_repeats=n_repeats,
+        model_params=model_params
       )
     )
 
@@ -824,7 +882,10 @@ def evaluate_lightgbm(
       run_regression(
         X=X,
         y=y,
-        feature_name_map=feature_name_map
+        feature_name_map=feature_name_map,
+        n_splits=n_splits,
+        n_repeats=n_repeats,
+        model_params=model_params
       )
     )
 
@@ -843,7 +904,8 @@ def evaluate_lightgbm_holdout(
   y_train: pd.Series,
   X_test_original: pd.DataFrame,
   y_test: pd.Series,
-  default_threshold: float = DEFAULT_THRESHOLD
+  default_threshold: float = DEFAULT_THRESHOLD,
+  model_params: dict | None = None
 ) -> dict:
   """
   学習データ全体でLightGBMを1回学習し、
@@ -862,6 +924,10 @@ def evaluate_lightgbm_holdout(
       "evaluate_lightgbm_holdout は二値分類を前提としています。"
     )
 
+  effective_model_params = resolve_model_params(
+    model_params
+  )
+
   X_train, feature_name_map = rename_features_for_lightgbm(
     X_train_original
   )
@@ -870,7 +936,7 @@ def evaluate_lightgbm_holdout(
   X_test.columns = X_train.columns
 
   model = LGBMClassifier(
-    **MODEL_PARAMS
+    **effective_model_params
   )
 
   model.fit(
@@ -934,7 +1000,10 @@ def run_lightgbm(
   config_path: str | Path,
   data_path: str | Path | None = None,
   skip_threshold_cv: bool = False,
-  default_threshold: float = DEFAULT_THRESHOLD
+  default_threshold: float = DEFAULT_THRESHOLD,
+  n_splits: int = N_SPLITS,
+  n_repeats: int = N_REPEATS,
+  model_params: dict | None = None
 ) -> Path:
   if data_path is None:
     X_original, y, config = filter_data(
@@ -951,7 +1020,10 @@ def run_lightgbm(
     y=y,
     config=config,
     skip_threshold_cv=skip_threshold_cv,
-    default_threshold=default_threshold
+    default_threshold=default_threshold,
+    n_splits=n_splits,
+    n_repeats=n_repeats,
+    model_params=model_params
   )
 
   all_data = evaluation["all_data"]
@@ -975,16 +1047,19 @@ def run_lightgbm(
     all_data=all_data,
     task_type=task_type,
     result_sheets=result_sheets,
-    feature_importance=feature_importance
+    feature_importance=feature_importance,
+    n_splits=n_splits,
+    n_repeats=n_repeats,
+    model_params=model_params
   )
 
   print(f"実験名: {experiment_name}")
   print(f"処理: {task_type}")
   print(f"被験者数: {len(X)}")
   print(f"説明変数数: {X.shape[1]}")
-  print(f"分割数: {N_SPLITS}")
-  print(f"反復回数: {N_REPEATS}")
-  print(f"学習回数: {N_SPLITS * N_REPEATS}")
+  print(f"分割数: {n_splits}")
+  print(f"反復回数: {n_repeats}")
+  print(f"学習回数: {n_splits * n_repeats}")
   if task_type == "classification" and y.nunique() == 2:
     if skip_threshold_cv:
       print(
@@ -1039,6 +1114,20 @@ def main() -> None:
   )
 
   parser.add_argument(
+    "--n-splits",
+    type=int,
+    default=N_SPLITS,
+    help=f"交差検証の分割数（既定: {N_SPLITS}）"
+  )
+
+  parser.add_argument(
+    "--n-repeats",
+    type=int,
+    default=N_REPEATS,
+    help=f"交差検証の反復回数（既定: {N_REPEATS}）"
+  )
+
+  parser.add_argument(
     "--skip-threshold-cv",
     action="store_true",
     help=(
@@ -1060,7 +1149,9 @@ def main() -> None:
     config_path=args.config,
     data_path=args.data,
     skip_threshold_cv=args.skip_threshold_cv,
-    default_threshold=args.default_threshold
+    default_threshold=args.default_threshold,
+    n_splits=args.n_splits,
+    n_repeats=args.n_repeats
   )
 
 

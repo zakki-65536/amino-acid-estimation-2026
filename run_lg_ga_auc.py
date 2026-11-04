@@ -16,6 +16,8 @@ from filter import filter_data
 import run_lightgbm as run_lightgbm_module
 from run_lightgbm import (
     DEFAULT_THRESHOLD,
+    N_REPEATS as LIGHTGBM_N_REPEATS,
+    N_SPLITS as LIGHTGBM_N_SPLITS,
     evaluate_lightgbm,
     evaluate_lightgbm_holdout,
     save_result,
@@ -176,6 +178,8 @@ def evaluate_chromosome(
     ],
     skip_threshold_cv: bool,
     fitness_lambda: float,
+    n_splits: int,
+    n_repeats: int,
     fitness_cache_lock: Lock,
 ) -> tuple[float, float, float]:
     """
@@ -225,6 +229,8 @@ def evaluate_chromosome(
             config=current_config,
             skip_threshold_cv=skip_threshold_cv,
             default_threshold=DEFAULT_THRESHOLD,
+            n_splits=n_splits,
+            n_repeats=n_repeats,
         )
         summary_metrics = evaluation[
             "result_sheets"
@@ -462,6 +468,8 @@ def run_ga_on_outer_train(
     random_seed: int,
     skip_threshold_cv: bool,
     fitness_lambda: float,
+    n_splits: int,
+    n_repeats: int,
     thread_count: int,
 ) -> tuple[
     list[str],
@@ -545,6 +553,8 @@ def run_ga_on_outer_train(
                 fitness_cache=fitness_cache,
                 skip_threshold_cv=skip_threshold_cv,
                 fitness_lambda=fitness_lambda,
+                n_splits=n_splits,
+                n_repeats=n_repeats,
                 fitness_cache_lock=fitness_cache_lock,
             )
 
@@ -836,6 +846,8 @@ def run_ga_on_outer_train(
         config=best_config,
         skip_threshold_cv=skip_threshold_cv,
         default_threshold=DEFAULT_THRESHOLD,
+        n_splits=n_splits,
+        n_repeats=n_repeats,
     )
 
     save_result(
@@ -847,6 +859,8 @@ def run_ga_on_outer_train(
         feature_importance=best_cv_evaluation[
             "feature_importance"
         ],
+        n_splits=n_splits,
+        n_repeats=n_repeats,
     )
 
     ga_summary_path = save_ga_summary(
@@ -918,6 +932,8 @@ def save_outer_fold_result(
     ga_cv_best_auc_mean: float,
     ga_cv_best_auc_std: float,
     fitness_lambda: float,
+    n_splits: int,
+    n_repeats: int,
     outer_test_auc: float,
     best_features: list[str],
     predictions: pd.DataFrame,
@@ -936,6 +952,8 @@ def save_outer_fold_result(
         "ga_cv_best_auc_mean": ga_cv_best_auc_mean,
         "ga_cv_best_auc_std": ga_cv_best_auc_std,
         "fitness_lambda": fitness_lambda,
+        "n_splits": n_splits,
+        "n_repeats": n_repeats,
         "outer_test_auc": outer_test_auc,
         "feature_count": len(best_features),
     }])
@@ -996,6 +1014,8 @@ def is_outer_fold_complete(
     repeat_number: int,
     fold_number: int,
     fitness_lambda: float,
+    n_splits: int,
+    n_repeats: int,
 ) -> tuple[bool, str]:
     """
     outer_test_result.xlsx が正常に保存済みなら、そのfoldは完了済みとみなす。
@@ -1046,6 +1066,8 @@ def is_outer_fold_complete(
             "ga_cv_best_auc_mean",
             "ga_cv_best_auc_std",
             "fitness_lambda",
+            "n_splits",
+            "n_repeats",
             "feature_count",
         }
 
@@ -1098,6 +1120,26 @@ def is_outer_fold_complete(
                 f"現在値={fitness_lambda})",
             )
 
+        saved_n_splits = int(
+            summary.iloc[0]["n_splits"]
+        )
+        saved_n_repeats = int(
+            summary.iloc[0]["n_repeats"]
+        )
+
+        if (
+            saved_n_splits != n_splits
+            or saved_n_repeats != n_repeats
+        ):
+            return (
+                False,
+                "LightGBM CV設定が現在の設定と一致しません "
+                f"(保存値={saved_n_splits}-fold × "
+                f"{saved_n_repeats}反復, "
+                f"現在値={n_splits}-fold × "
+                f"{n_repeats}反復)",
+            )
+
         outer_test_auc = float(
             summary.iloc[0]["outer_test_auc"]
         )
@@ -1132,6 +1174,8 @@ def run_genetic_algorithm_repeated_cv(
     output_path: str | Path | None = None,
     skip_threshold_cv: bool = False,
     fitness_lambda: float = 0.5,
+    n_splits: int = LIGHTGBM_N_SPLITS,
+    n_repeats: int = LIGHTGBM_N_REPEATS,
     thread_count: int = GA_THREAD_COUNT,
 ) -> Path:
     if data_path is None:
@@ -1217,6 +1261,16 @@ def run_genetic_algorithm_repeated_cv(
             "fitness_lambda は0以上にしてください。"
         )
 
+    if n_splits < 2:
+        raise ValueError(
+            "n_splits は2以上にしてください。"
+        )
+
+    if n_repeats < 1:
+        raise ValueError(
+            "n_repeats は1以上にしてください。"
+        )
+
     if thread_count < 1:
         raise ValueError(
             "thread_count は1以上にしてください。"
@@ -1265,6 +1319,11 @@ def run_genetic_algorithm_repeated_cv(
     )
     print(f"個体数: {population_size}")
     print(f"GA個体評価スレッド数: {thread_count}")
+    print(
+        "GA内部LightGBM CV: "
+        f"{n_splits}-fold × {n_repeats}反復 "
+        f"= {n_splits * n_repeats} splits"
+    )
     print(f"最大世代数: {generations}")
     print(
         "Fitness: mean(AUC) - "
@@ -1335,6 +1394,8 @@ def run_genetic_algorithm_repeated_cv(
             repeat_number=repeat_number,
             fold_number=fold_number,
             fitness_lambda=fitness_lambda,
+            n_splits=n_splits,
+            n_repeats=n_repeats,
         )
 
         if fold_is_complete:
@@ -1417,6 +1478,8 @@ def run_genetic_algorithm_repeated_cv(
             random_seed=fold_ga_seed,
             skip_threshold_cv=skip_threshold_cv,
             fitness_lambda=fitness_lambda,
+            n_splits=n_splits,
+            n_repeats=n_repeats,
             thread_count=thread_count,
         )
 
@@ -1458,6 +1521,8 @@ def run_genetic_algorithm_repeated_cv(
             ga_cv_best_auc_mean=ga_cv_best_auc_mean,
             ga_cv_best_auc_std=ga_cv_best_auc_std,
             fitness_lambda=fitness_lambda,
+            n_splits=n_splits,
+            n_repeats=n_repeats,
             outer_test_auc=outer_test_auc,
             best_features=best_features,
             predictions=predictions,
@@ -1472,6 +1537,8 @@ def run_genetic_algorithm_repeated_cv(
             repeat_number=repeat_number,
             fold_number=fold_number,
             fitness_lambda=fitness_lambda,
+            n_splits=n_splits,
+            n_repeats=n_repeats,
         )
 
         if not saved_ok:
@@ -1646,6 +1713,26 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--n-splits",
+        type=int,
+        default=LIGHTGBM_N_SPLITS,
+        help=(
+            "GA内部でrun_lightgbm.pyが使用する交差検証の分割数。"
+            f"デフォルト{LIGHTGBM_N_SPLITS}"
+        ),
+    )
+
+    parser.add_argument(
+        "--n-repeats",
+        type=int,
+        default=LIGHTGBM_N_REPEATS,
+        help=(
+            "GA内部でrun_lightgbm.pyが使用する交差検証の反復回数。"
+            f"デフォルト{LIGHTGBM_N_REPEATS}"
+        ),
+    )
+
+    parser.add_argument(
         "--threads",
         type=int,
         default=GA_THREAD_COUNT,
@@ -1680,6 +1767,8 @@ def main() -> None:
         output_path=args.output,
         skip_threshold_cv=args.skip_threshold_cv,
         fitness_lambda=args.fitness_lambda,
+        n_splits=args.n_splits,
+        n_repeats=args.n_repeats,
         thread_count=args.threads,
     )
 

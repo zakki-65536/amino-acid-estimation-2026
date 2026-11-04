@@ -167,12 +167,20 @@ def evaluate_chromosome(
     X_train: pd.DataFrame,
     y_train: pd.Series,
     config: dict,
-    fitness_cache: dict[tuple[int, ...], float],
+    fitness_cache: dict[
+        tuple[int, ...],
+        tuple[float, float, float],
+    ],
     skip_threshold_cv: bool,
-) -> float:
+    fitness_lambda: float,
+) -> tuple[float, float, float]:
     """
-    outer TRAINだけを使って候補特徴量集合をCV評価し、
-    roc_auc の平均値をGAのFitnessとして返す。
+    outer TRAINだけを使って候補特徴量集合をCV評価する。
+
+    Fitness = mean(AUC) - fitness_lambda * std(AUC)
+
+    戻り値:
+      (fitness, auc_mean, auc_std)
 
     outer TESTはここでは一切使用しない。
     """
@@ -187,8 +195,13 @@ def evaluate_chromosome(
     )
 
     if not selected_features:
-        fitness_cache[key] = float("-inf")
-        return fitness_cache[key]
+        result = (
+            float("-inf"),
+            float("nan"),
+            float("nan"),
+        )
+        fitness_cache[key] = result
+        return result
 
     current_config = copy.deepcopy(config)
     current_config["features"] = selected_features
@@ -214,19 +227,39 @@ def evaluate_chromosome(
             "roc_auc",
             "mean",
         )
+        auc_std = get_metric(
+            summary_metrics,
+            "roc_auc",
+            "std",
+        )
 
-        if not np.isfinite(auc_mean):
-            auc_mean = float("-inf")
+        if (
+            not np.isfinite(auc_mean)
+            or not np.isfinite(auc_std)
+        ):
+            fitness = float("-inf")
+        else:
+            fitness = (
+                auc_mean
+                - fitness_lambda * auc_std
+            )
 
     except Exception as exc:
         print(
             "評価失敗: "
             f"{len(selected_features)}項目 / {exc}"
         )
-        auc_mean = float("-inf")
+        fitness = float("-inf")
+        auc_mean = float("nan")
+        auc_std = float("nan")
 
-    fitness_cache[key] = auc_mean
-    return auc_mean
+    result = (
+        float(fitness),
+        float(auc_mean),
+        float(auc_std),
+    )
+    fitness_cache[key] = result
+    return result
 
 
 def tournament_selection(
@@ -306,7 +339,10 @@ def save_ga_summary(
     best_features: list[str],
     all_features: list[str],
     best_chromosome: np.ndarray,
-    fitness_cache: dict[tuple[int, ...], float],
+    fitness_cache: dict[
+        tuple[int, ...],
+        tuple[float, float, float],
+    ],
 ) -> Path:
     summary_path = output_dir / "ga_summary.xlsx"
 
@@ -329,7 +365,9 @@ def save_ga_summary(
 
     cache_rows = []
 
-    for chromosome_key, fitness in fitness_cache.items():
+    for chromosome_key, values in fitness_cache.items():
+        fitness, auc_mean, auc_std = values
+
         selected_features = [
             feature
             for gene, feature in zip(
@@ -340,7 +378,9 @@ def save_ga_summary(
         ]
 
         cache_rows.append({
-            "fitness_auc": fitness,
+            "fitness": fitness,
+            "auc_mean": auc_mean,
+            "auc_std": auc_std,
             "feature_count": len(selected_features),
             "features": ",".join(selected_features),
             "chromosome": "".join(
@@ -352,7 +392,7 @@ def save_ga_summary(
     evaluated_df = (
         pd.DataFrame(cache_rows)
         .sort_values(
-            "fitness_auc",
+            "fitness",
             ascending=False,
         )
         .reset_index(drop=True)
@@ -412,8 +452,11 @@ def run_ga_on_outer_train(
     max_features: int,
     random_seed: int,
     skip_threshold_cv: bool,
+    fitness_lambda: float,
 ) -> tuple[
     list[str],
+    float,
+    float,
     float,
     np.ndarray,
     Path,
@@ -422,6 +465,9 @@ def run_ga_on_outer_train(
     """
     1つのouter TRAIN内だけでGAを完結させる。
     outer TESTは受け取らないため、特徴量決定に利用できない。
+
+    個体の評価値:
+      Fitness = mean(AUC) - fitness_lambda * std(AUC)
     """
     random.seed(random_seed)
     np.random.seed(random_seed)
@@ -439,7 +485,7 @@ def run_ga_on_outer_train(
 
     fitness_cache: dict[
         tuple[int, ...],
-        float,
+        tuple[float, float, float],
     ] = {}
 
     generation_history: list[dict] = []
@@ -447,6 +493,8 @@ def run_ga_on_outer_train(
 
     global_best_chromosome: np.ndarray | None = None
     global_best_fitness = float("-inf")
+    global_best_auc_mean = float("nan")
+    global_best_auc_std = float("nan")
     no_improvement_generations = 0
 
     for generation in range(
@@ -459,12 +507,18 @@ def run_ga_on_outer_train(
         )
 
         fitnesses: list[float] = []
+        auc_means: list[float] = []
+        auc_stds: list[float] = []
 
         for individual_index, chromosome in enumerate(
             population,
             start=1,
         ):
-            fitness = evaluate_chromosome(
+            (
+                fitness,
+                auc_mean,
+                auc_std,
+            ) = evaluate_chromosome(
                 chromosome=chromosome,
                 all_features=all_features,
                 X_train=X_train,
@@ -472,9 +526,12 @@ def run_ga_on_outer_train(
                 config=config,
                 fitness_cache=fitness_cache,
                 skip_threshold_cv=skip_threshold_cv,
+                fitness_lambda=fitness_lambda,
             )
 
             fitnesses.append(fitness)
+            auc_means.append(auc_mean)
+            auc_stds.append(auc_std)
 
             selected_features = chromosome_to_features(
                 chromosome,
@@ -484,7 +541,10 @@ def run_ga_on_outer_train(
             individual_history.append({
                 "generation": generation,
                 "individual": individual_index,
-                "fitness_auc": fitness,
+                "fitness": fitness,
+                "auc_mean": auc_mean,
+                "auc_std": auc_std,
+                "fitness_lambda": fitness_lambda,
                 "feature_count": len(selected_features),
                 "features": ",".join(selected_features),
                 "chromosome": "".join(
@@ -495,24 +555,34 @@ def run_ga_on_outer_train(
 
             print(
                 f"  Individual {individual_index:02d}: "
-                f"AUC={fitness:.6f}, "
+                f"AUC={auc_mean:.6f} ± {auc_std:.6f}, "
+                f"Fitness={fitness:.6f}, "
                 f"features={len(selected_features)}"
             )
 
-        finite_fitnesses = [
-            value
-            for value in fitnesses
+        finite_indexes = [
+            i
+            for i, value in enumerate(fitnesses)
             if np.isfinite(value)
         ]
 
-        if not finite_fitnesses:
+        if not finite_indexes:
             raise RuntimeError(
                 "全個体の評価に失敗しました。"
             )
 
-        best_index = int(np.argmax(fitnesses))
+        best_index = max(
+            finite_indexes,
+            key=lambda i: fitnesses[i],
+        )
         generation_best_fitness = float(
             fitnesses[best_index]
+        )
+        generation_best_auc_mean = float(
+            auc_means[best_index]
+        )
+        generation_best_auc_std = float(
+            auc_stds[best_index]
         )
         generation_best_chromosome = (
             population[best_index].copy()
@@ -522,10 +592,14 @@ def run_ga_on_outer_train(
             all_features,
         )
 
-        generation_mean = float(
+        finite_fitnesses = [
+            fitnesses[i]
+            for i in finite_indexes
+        ]
+        generation_fitness_mean = float(
             np.mean(finite_fitnesses)
         )
-        generation_std = float(
+        generation_fitness_std = float(
             np.std(finite_fitnesses, ddof=0)
         )
 
@@ -535,6 +609,8 @@ def run_ga_on_outer_train(
 
         if improved:
             global_best_fitness = generation_best_fitness
+            global_best_auc_mean = generation_best_auc_mean
+            global_best_auc_std = generation_best_auc_std
             global_best_chromosome = (
                 generation_best_chromosome.copy()
             )
@@ -544,9 +620,12 @@ def run_ga_on_outer_train(
 
         generation_history.append({
             "generation": generation,
-            "best_auc": generation_best_fitness,
-            "mean_auc": generation_mean,
-            "std_auc": generation_std,
+            "best_fitness": generation_best_fitness,
+            "best_auc_mean": generation_best_auc_mean,
+            "best_auc_std": generation_best_auc_std,
+            "fitness_mean": generation_fitness_mean,
+            "fitness_std": generation_fitness_std,
+            "fitness_lambda": fitness_lambda,
             "best_feature_count": len(
                 generation_best_features
             ),
@@ -556,7 +635,9 @@ def run_ga_on_outer_train(
             "unique_evaluated_total": len(
                 fitness_cache
             ),
-            "global_best_auc": global_best_fitness,
+            "global_best_fitness": global_best_fitness,
+            "global_best_auc_mean": global_best_auc_mean,
+            "global_best_auc_std": global_best_auc_std,
             "improved": improved,
             "no_improvement_generations": (
                 no_improvement_generations
@@ -564,16 +645,21 @@ def run_ga_on_outer_train(
         })
 
         print(
-            "  世代最良 AUC: "
-            f"{generation_best_fitness:.6f}"
+            "  世代最良: "
+            f"AUC={generation_best_auc_mean:.6f} "
+            f"± {generation_best_auc_std:.6f}, "
+            f"Fitness={generation_best_fitness:.6f}"
         )
         print(
-            "  世代平均 AUC: "
-            f"{generation_mean:.6f} ± {generation_std:.6f}"
+            "  世代Fitness平均: "
+            f"{generation_fitness_mean:.6f} "
+            f"± {generation_fitness_std:.6f}"
         )
         print(
-            "  全世代最良 AUC: "
-            f"{global_best_fitness:.6f}"
+            "  全世代最良: "
+            f"AUC={global_best_auc_mean:.6f} "
+            f"± {global_best_auc_std:.6f}, "
+            f"Fitness={global_best_fitness:.6f}"
         )
         print(
             "  改善なし世代数: "
@@ -588,7 +674,7 @@ def run_ga_on_outer_train(
             print(
                 "  早期終了: "
                 f"{early_stopping_rounds}世代連続で "
-                "最良AUCが改善しなかったため、"
+                "最良Fitnessが改善しなかったため、"
                 f"Generation {generation} で終了します。"
             )
             break
@@ -716,6 +802,8 @@ def run_ga_on_outer_train(
     return (
         best_features,
         global_best_fitness,
+        global_best_auc_mean,
+        global_best_auc_std,
         global_best_chromosome,
         best_cv_result_path,
         ga_summary_path,
@@ -766,7 +854,10 @@ def save_outer_fold_result(
     fold_number: int,
     train_indexes: np.ndarray,
     test_indexes: np.ndarray,
-    ga_cv_best_auc: float,
+    ga_cv_best_fitness: float,
+    ga_cv_best_auc_mean: float,
+    ga_cv_best_auc_std: float,
+    fitness_lambda: float,
     outer_test_auc: float,
     best_features: list[str],
     predictions: pd.DataFrame,
@@ -781,7 +872,10 @@ def save_outer_fold_result(
         "outer_fold": fold_number,
         "train_count": len(train_indexes),
         "test_count": len(test_indexes),
-        "ga_cv_best_auc": ga_cv_best_auc,
+        "ga_cv_best_fitness": ga_cv_best_fitness,
+        "ga_cv_best_auc_mean": ga_cv_best_auc_mean,
+        "ga_cv_best_auc_std": ga_cv_best_auc_std,
+        "fitness_lambda": fitness_lambda,
         "outer_test_auc": outer_test_auc,
         "feature_count": len(best_features),
     }])
@@ -836,6 +930,157 @@ def save_outer_fold_result(
     return output_path
 
 
+def is_outer_fold_complete(
+    output_dir: Path,
+    repeat_number: int,
+    fold_number: int,
+    fitness_lambda: float,
+) -> tuple[bool, str]:
+    """
+    outer_test_result.xlsx が正常に保存済みなら、
+    そのfoldは完了済みとみなす。
+    """
+    result_path = (
+        output_dir / "outer_test_result.xlsx"
+    )
+
+    if not result_path.exists():
+        return (
+            False,
+            "outer_test_result.xlsx が存在しません",
+        )
+
+    try:
+        with pd.ExcelFile(
+            result_path,
+            engine="openpyxl",
+        ) as excel_file:
+            required_sheets = {
+                "summary",
+                "best_features",
+                "test_predictions",
+                "feature_importance",
+                "data_split",
+            }
+
+            missing_sheets = (
+                required_sheets
+                - set(excel_file.sheet_names)
+            )
+
+            if missing_sheets:
+                return (
+                    False,
+                    "必要なシートが不足しています: "
+                    + ", ".join(
+                        sorted(missing_sheets)
+                    ),
+                )
+
+            summary = pd.read_excel(
+                excel_file,
+                sheet_name="summary",
+            )
+
+        required_columns = {
+            "outer_repeat",
+            "outer_fold",
+            "outer_test_auc",
+            "ga_cv_best_fitness",
+            "ga_cv_best_auc_mean",
+            "ga_cv_best_auc_std",
+            "fitness_lambda",
+            "feature_count",
+        }
+
+        missing_columns = (
+            required_columns
+            - set(summary.columns)
+        )
+
+        if missing_columns:
+            return (
+                False,
+                "summaryシートの必要列が不足しています: "
+                + ", ".join(
+                    sorted(missing_columns)
+                ),
+            )
+
+        if summary.empty:
+            return (
+                False,
+                "summaryシートが空です",
+            )
+
+        saved_repeat = int(
+            summary.iloc[0][
+                "outer_repeat"
+            ]
+        )
+
+        saved_fold = int(
+            summary.iloc[0][
+                "outer_fold"
+            ]
+        )
+
+        if (
+            saved_repeat != repeat_number
+            or saved_fold != fold_number
+        ):
+            return (
+                False,
+                "summaryシートのrepeat/foldが一致しません "
+                f"(保存値={saved_repeat}/{saved_fold})",
+            )
+
+        saved_fitness_lambda = float(
+            summary.iloc[0][
+                "fitness_lambda"
+            ]
+        )
+
+        if not np.isclose(
+            saved_fitness_lambda,
+            fitness_lambda,
+            rtol=0.0,
+            atol=1e-12,
+        ):
+            return (
+                False,
+                "fitness_lambda が現在の設定と一致しません "
+                f"(保存値={saved_fitness_lambda}, "
+                f"現在値={fitness_lambda})",
+            )
+
+        outer_test_auc = float(
+            summary.iloc[0][
+                "outer_test_auc"
+            ]
+        )
+
+        if not np.isfinite(
+            outer_test_auc
+        ):
+            return (
+                False,
+                "outer_test_auc が有限値ではありません",
+            )
+
+    except Exception as exc:
+        return (
+            False,
+            "outer_test_result.xlsx を"
+            f"正常に読み込めません: {exc}",
+        )
+
+    return (
+        True,
+        "outer_test_result.xlsx 検証OK",
+    )
+
+
 def create_feature_selection_frequency(
     feature_sets: pd.DataFrame,
     all_features: list[str],
@@ -882,6 +1127,7 @@ def run_genetic_algorithm_repeated_cv(
     outer_random_state: int = OUTER_RANDOM_STATE,
     output_path: str | Path | None = None,
     skip_threshold_cv: bool = False,
+    fitness_lambda: float = 0.5,
 ) -> Path:
     if data_path is None:
         X_all, y_all, config = filter_data(
@@ -895,7 +1141,7 @@ def run_genetic_algorithm_repeated_cv(
 
     if y_all.nunique() != 2:
         raise ValueError(
-            "このGAプログラムのFitness=roc_aucは二値分類を前提としています。"
+            "このGAプログラムのAUCベースFitnessは二値分類を前提としています。"
         )
 
     all_features = (
@@ -961,6 +1207,11 @@ def run_genetic_algorithm_repeated_cv(
             "crossover_rate は0～1にしてください。"
         )
 
+    if fitness_lambda < 0.0:
+        raise ValueError(
+            "fitness_lambda は0以上にしてください。"
+        )
+
     experiment_name = config["experiment_name"]
 
     if output_path is None:
@@ -1005,8 +1256,12 @@ def run_genetic_algorithm_repeated_cv(
     print(f"個体数: {population_size}")
     print(f"最大世代数: {generations}")
     print(
+        "Fitness: mean(AUC) - "
+        f"{fitness_lambda:g} × std(AUC)"
+    )
+    print(
         "早期終了条件: "
-        f"{early_stopping_rounds}世代連続で最良AUCの改善なし"
+        f"{early_stopping_rounds}世代連続で最良Fitnessの改善なし"
     )
     print(
         "GA内部の閾値決定CV: "
@@ -1024,9 +1279,13 @@ def run_genetic_algorithm_repeated_cv(
         f"{min_features}～{max_features}"
     )
 
-    outer_result_rows: list[dict] = []
-    feature_set_frames: list[pd.DataFrame] = []
-    prediction_frames: list[pd.DataFrame] = []
+    print(
+        "自動再開: 各foldの outer_test_result.xlsx を検証し、"
+        "完了済みfoldはスキップします。"
+    )
+
+    skipped_fold_count = 0
+    executed_fold_count = 0
 
     for split_number, (
         train_indexes,
@@ -1039,6 +1298,54 @@ def run_genetic_algorithm_repeated_cv(
             get_outer_repeat_and_fold(split_number)
         )
 
+        fold_output_dir = (
+            output_dir
+            / f"repeat_{repeat_number:02d}"
+            / f"fold_{fold_number:02d}"
+        )
+
+        (
+            fold_is_complete,
+            completion_reason,
+        ) = is_outer_fold_complete(
+            output_dir=fold_output_dir,
+            repeat_number=repeat_number,
+            fold_number=fold_number,
+            fitness_lambda=fitness_lambda,
+        )
+
+        if fold_is_complete:
+            skipped_fold_count += 1
+
+            print(
+                f"[{current_timestamp()}] "
+                "完了済みのためスキップ: "
+                f"Repeat {repeat_number}, "
+                f"Fold {fold_number}"
+            )
+
+            print(
+                f"  判定: {completion_reason}"
+            )
+
+            continue
+
+        if fold_output_dir.exists():
+            print(
+                "  既存フォルダはありますが"
+                "未完了と判定したため、"
+                "このfoldを最初から再実行します。"
+            )
+
+            print(
+                f"  判定理由: "
+                f"{completion_reason}"
+            )
+
+        fold_output_dir.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
         print(
             "\n"
             + "=" * 70
@@ -1073,16 +1380,6 @@ def run_genetic_algorithm_repeated_cv(
             f"outer TEST: {len(X_test)}件"
         )
 
-        fold_output_dir = (
-            output_dir
-            / f"repeat_{repeat_number:02d}"
-            / f"fold_{fold_number:02d}"
-        )
-        fold_output_dir.mkdir(
-            parents=True,
-            exist_ok=True,
-        )
-
         # 各outer splitでGAを独立実行する。
         # splitごとにseedをずらして、GA探索も独立させる。
         fold_ga_seed = (
@@ -1091,7 +1388,9 @@ def run_genetic_algorithm_repeated_cv(
 
         (
             best_features,
-            ga_cv_best_auc,
+            ga_cv_best_fitness,
+            ga_cv_best_auc_mean,
+            ga_cv_best_auc_std,
             _best_chromosome,
             _best_cv_result_path,
             _ga_summary_path,
@@ -1112,6 +1411,7 @@ def run_genetic_algorithm_repeated_cv(
             max_features=max_features,
             random_seed=fold_ga_seed,
             skip_threshold_cv=skip_threshold_cv,
+            fitness_lambda=fitness_lambda,
         )
 
         (
@@ -1142,47 +1442,62 @@ def run_genetic_algorithm_repeated_cv(
             "outer_repeat",
             repeat_number,
         )
-        prediction_frames.append(predictions)
 
-        save_outer_fold_result(
+        outer_result_path = (
+            save_outer_fold_result(
+                output_dir=fold_output_dir,
+                repeat_number=repeat_number,
+                fold_number=fold_number,
+                train_indexes=train_indexes,
+                test_indexes=test_indexes,
+                ga_cv_best_fitness=(
+                    ga_cv_best_fitness
+                ),
+                ga_cv_best_auc_mean=(
+                    ga_cv_best_auc_mean
+                ),
+                ga_cv_best_auc_std=(
+                    ga_cv_best_auc_std
+                ),
+                fitness_lambda=(
+                    fitness_lambda
+                ),
+                outer_test_auc=(
+                    outer_test_auc
+                ),
+                best_features=best_features,
+                predictions=predictions,
+                feature_importance=(
+                    feature_importance
+                ),
+            )
+        )
+
+        (
+            saved_ok,
+            saved_reason,
+        ) = is_outer_fold_complete(
             output_dir=fold_output_dir,
             repeat_number=repeat_number,
             fold_number=fold_number,
-            train_indexes=train_indexes,
-            test_indexes=test_indexes,
-            ga_cv_best_auc=ga_cv_best_auc,
-            outer_test_auc=outer_test_auc,
-            best_features=best_features,
-            predictions=predictions,
-            feature_importance=feature_importance,
+            fitness_lambda=fitness_lambda,
         )
 
-        outer_result_rows.append({
-            "outer_repeat": repeat_number,
-            "outer_fold": fold_number,
-            "outer_split": split_number,
-            "ga_seed": fold_ga_seed,
-            "skip_threshold_cv": skip_threshold_cv,
-            "train_count": len(train_indexes),
-            "test_count": len(test_indexes),
-            "ga_cv_best_auc": ga_cv_best_auc,
-            "outer_test_auc": outer_test_auc,
-            "feature_count": len(best_features),
-            "features": ",".join(best_features),
-        })
+        if not saved_ok:
+            raise RuntimeError(
+                "fold結果の保存後検証に失敗しました: "
+                f"{saved_reason}"
+            )
 
-        feature_set_frames.append(
-            pd.DataFrame({
-                "outer_repeat": repeat_number,
-                "outer_fold": fold_number,
-                "outer_split": split_number,
-                "feature": best_features,
-            })
-        )
-
+        executed_fold_count += 1
         print("\n  ----- outer TEST評価 -----")
         print(
-            f"  GA CV 最良AUC: {ga_cv_best_auc:.6f}"
+            "  GA選択個体 CV AUC: "
+            f"{ga_cv_best_auc_mean:.6f} "
+            f"± {ga_cv_best_auc_std:.6f}"
+        )
+        print(
+            f"  GA最良Fitness: {ga_cv_best_fitness:.6f}"
         )
         print(
             f"  outer TEST AUC: {outer_test_auc:.6f}"
@@ -1190,174 +1505,37 @@ def run_genetic_algorithm_repeated_cv(
         print(
             f"  選択特徴量数: {len(best_features)}"
         )
-
-    outer_results = pd.DataFrame(
-        outer_result_rows
-    )
-    feature_sets = pd.concat(
-        feature_set_frames,
-        ignore_index=True,
-    )
-    all_predictions = pd.concat(
-        prediction_frames,
-        ignore_index=True,
-    )
-
-    feature_frequency = (
-        create_feature_selection_frequency(
-            feature_sets=feature_sets,
-            all_features=all_features,
-            total_outer_splits=total_outer_splits,
-        )
-    )
-
-    # 50個のfold AUCの集計
-    fold_auc_summary = pd.DataFrame([{
-        "outer_fold_auc_mean": (
-            outer_results["outer_test_auc"].mean()
-        ),
-        "outer_fold_auc_std": (
-            outer_results["outer_test_auc"].std()
-        ),
-        "outer_fold_auc_min": (
-            outer_results["outer_test_auc"].min()
-        ),
-        "outer_fold_auc_max": (
-            outer_results["outer_test_auc"].max()
-        ),
-        "outer_fold_auc_median": (
-            outer_results["outer_test_auc"].median()
-        ),
-        "ga_cv_best_auc_mean": (
-            outer_results["ga_cv_best_auc"].mean()
-        ),
-        "selected_feature_count_mean": (
-            outer_results["feature_count"].mean()
-        ),
-        "selected_feature_count_std": (
-            outer_results["feature_count"].std()
-        ),
-        "outer_splits": total_outer_splits,
-        "outer_n_splits": OUTER_N_SPLITS,
-        "outer_n_repeats": OUTER_N_REPEATS,
-        "outer_random_state": outer_random_state,
-        "skip_threshold_cv": skip_threshold_cv,
-    }])
-
-    # 各repeatについて5fold分のOOF予測をまとめたAUCを算出する。
-    repeat_rows = []
-
-    for repeat_number in range(
-        1,
-        OUTER_N_REPEATS + 1,
-    ):
-        repeat_predictions = all_predictions[
-            all_predictions["outer_repeat"]
-            == repeat_number
-        ]
-
-        repeat_auc = float(
-            roc_auc_score(
-                repeat_predictions["actual"],
-                repeat_predictions[
-                    "probability_positive"
-                ],
-            )
+        print(
+            f"  fold結果保存先: {outer_result_path}"
         )
 
-        repeat_rows.append({
-            "outer_repeat": repeat_number,
-            "oof_auc": repeat_auc,
-        })
-
-    repeat_auc_df = pd.DataFrame(
-        repeat_rows
-    )
-
-    repeat_auc_summary = pd.DataFrame([{
-        "repeat_oof_auc_mean": (
-            repeat_auc_df["oof_auc"].mean()
-        ),
-        "repeat_oof_auc_std": (
-            repeat_auc_df["oof_auc"].std()
-        ),
-        "repeat_oof_auc_min": (
-            repeat_auc_df["oof_auc"].min()
-        ),
-        "repeat_oof_auc_max": (
-            repeat_auc_df["oof_auc"].max()
-        ),
-        "repeat_count": OUTER_N_REPEATS,
-    }])
-
-    summary_output_path = (
-        output_dir / "outer_cv_summary.xlsx"
-    )
-
-    with pd.ExcelWriter(
-        summary_output_path,
-        engine="openpyxl",
-    ) as writer:
-        fold_auc_summary.to_excel(
-            writer,
-            sheet_name="summary",
-            index=False,
-        )
-        repeat_auc_summary.to_excel(
-            writer,
-            sheet_name="repeat_summary",
-            index=False,
-        )
-        repeat_auc_df.to_excel(
-            writer,
-            sheet_name="repeat_auc",
-            index=False,
-        )
-        outer_results.to_excel(
-            writer,
-            sheet_name="outer_fold_results",
-            index=False,
-        )
-        feature_sets.to_excel(
-            writer,
-            sheet_name="feature_sets",
-            index=False,
-        )
-        feature_frequency.to_excel(
-            writer,
-            sheet_name="feature_frequency",
-            index=False,
-        )
-        all_predictions.to_excel(
-            writer,
-            sheet_name="test_predictions",
-            index=False,
-        )
+    # ↑ ここで for split_number ... のループが終了
 
     print("\n" + "=" * 70)
-    print("===== 外側5-fold × 10反復 最終結果 =====")
+    print("===== 外側CV 実行終了 =====")
     print("=" * 70)
+
     print(
-        "50 foldのouter TEST AUC: "
-        f"{fold_auc_summary.iloc[0]['outer_fold_auc_mean']:.6f} "
-        "± "
-        f"{fold_auc_summary.iloc[0]['outer_fold_auc_std']:.6f}"
-    )
-    print(
-        "10 repeatのOOF AUC: "
-        f"{repeat_auc_summary.iloc[0]['repeat_oof_auc_mean']:.6f} "
-        "± "
-        f"{repeat_auc_summary.iloc[0]['repeat_oof_auc_std']:.6f}"
-    )
-    print(
-        "平均選択特徴量数: "
-        f"{fold_auc_summary.iloc[0]['selected_feature_count_mean']:.2f}"
-    )
-    print(
-        f"\n集計結果保存先: {summary_output_path}"
+        f"今回実行したfold: "
+        f"{executed_fold_count}"
     )
 
-    return summary_output_path
+    print(
+        f"完了済みでスキップしたfold: "
+        f"{skipped_fold_count}"
+    )
+
+    print(
+        "outer_cv_summary.xlsx は"
+        "このプログラムでは作成しません。"
+    )
+
+    print(
+        f"結果保存先: {output_dir}"
+    )
+
+    return output_dir
+
 
 
 def main() -> None:
@@ -1393,7 +1571,7 @@ def main() -> None:
         type=int,
         default=10,
         help=(
-            "最良AUCが改善しない状態が何世代続いたら"
+            "最良Fitnessが改善しない状態が何世代続いたら"
             "早期終了するか（デフォルト10）"
         ),
     )
@@ -1474,6 +1652,16 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--fitness-lambda",
+        type=float,
+        default=0.5,
+        help=(
+            "Fitness = mean(AUC) - lambda × std(AUC) のlambda。"
+            "デフォルト0.5"
+        ),
+    )
+
+    parser.add_argument(
         "--output",
         default=None,
         help="結果保存ディレクトリ",
@@ -1497,6 +1685,7 @@ def main() -> None:
         outer_random_state=args.outer_seed,
         output_path=args.output,
         skip_threshold_cv=args.skip_threshold_cv,
+        fitness_lambda=args.fitness_lambda,
     )
 
 

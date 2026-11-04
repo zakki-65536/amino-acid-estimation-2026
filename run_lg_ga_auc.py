@@ -3,15 +3,17 @@ from __future__ import annotations
 import argparse
 import copy
 import random
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from threading import Lock
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import RepeatedStratifiedKFold
 
 from filter import filter_data
+import run_lightgbm as run_lightgbm_module
 from run_lightgbm import (
     DEFAULT_THRESHOLD,
     evaluate_lightgbm,
@@ -27,6 +29,7 @@ RESULT_DIR = BASE_DIR / "result"
 OUTER_N_SPLITS = 5
 OUTER_N_REPEATS = 10
 OUTER_RANDOM_STATE = 42
+GA_THREAD_COUNT = 32
 
 
 def current_timestamp() -> str:
@@ -173,6 +176,7 @@ def evaluate_chromosome(
     ],
     skip_threshold_cv: bool,
     fitness_lambda: float,
+    fitness_cache_lock: Lock,
 ) -> tuple[float, float, float]:
     """
     outer TRAINだけを使って候補特徴量集合をCV評価する。
@@ -186,8 +190,11 @@ def evaluate_chromosome(
     """
     key = tuple(int(x) for x in chromosome)
 
-    if key in fitness_cache:
-        return fitness_cache[key]
+    with fitness_cache_lock:
+        cached_result = fitness_cache.get(key)
+
+    if cached_result is not None:
+        return cached_result
 
     selected_features = chromosome_to_features(
         chromosome,
@@ -200,7 +207,8 @@ def evaluate_chromosome(
             float("nan"),
             float("nan"),
         )
-        fitness_cache[key] = result
+        with fitness_cache_lock:
+            fitness_cache[key] = result
         return result
 
     current_config = copy.deepcopy(config)
@@ -258,7 +266,8 @@ def evaluate_chromosome(
         float(auc_mean),
         float(auc_std),
     )
-    fitness_cache[key] = result
+    with fitness_cache_lock:
+        fitness_cache[key] = result
     return result
 
 
@@ -453,6 +462,7 @@ def run_ga_on_outer_train(
     random_seed: int,
     skip_threshold_cv: bool,
     fitness_lambda: float,
+    thread_count: int,
 ) -> tuple[
     list[str],
     float,
@@ -487,6 +497,7 @@ def run_ga_on_outer_train(
         tuple[int, ...],
         tuple[float, float, float],
     ] = {}
+    fitness_cache_lock = Lock()
 
     generation_history: list[dict] = []
     individual_history: list[dict] = []
@@ -510,15 +521,22 @@ def run_ga_on_outer_train(
         auc_means: list[float] = []
         auc_stds: list[float] = []
 
-        for individual_index, chromosome in enumerate(
-            population,
-            start=1,
-        ):
-            (
-                fitness,
-                auc_mean,
-                auc_std,
-            ) = evaluate_chromosome(
+        # 同一世代に同じ染色体が複数ある場合は1回だけ評価する。
+        unique_chromosomes: list[np.ndarray] = []
+        unique_keys: list[tuple[int, ...]] = []
+        seen_keys: set[tuple[int, ...]] = set()
+
+        for chromosome in population:
+            key = tuple(int(x) for x in chromosome)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                unique_keys.append(key)
+                unique_chromosomes.append(chromosome)
+
+        def evaluate_one(
+            chromosome: np.ndarray,
+        ) -> tuple[float, float, float]:
+            return evaluate_chromosome(
                 chromosome=chromosome,
                 all_features=all_features,
                 X_train=X_train,
@@ -527,7 +545,49 @@ def run_ga_on_outer_train(
                 fitness_cache=fitness_cache,
                 skip_threshold_cv=skip_threshold_cv,
                 fitness_lambda=fitness_lambda,
+                fitness_cache_lock=fitness_cache_lock,
             )
+
+        # 個体をスレッド並列で評価する。
+        # LightGBM自身のn_jobsは1にして二重並列を避ける。
+        previous_lgbm_n_jobs = (
+            run_lightgbm_module.MODEL_PARAMS.get(
+                "n_jobs",
+                -1,
+            )
+        )
+        run_lightgbm_module.MODEL_PARAMS["n_jobs"] = 1
+
+        try:
+            with ThreadPoolExecutor(
+                max_workers=thread_count
+            ) as executor:
+                unique_results = list(
+                    executor.map(
+                        evaluate_one,
+                        unique_chromosomes,
+                    )
+                )
+        finally:
+            run_lightgbm_module.MODEL_PARAMS[
+                "n_jobs"
+            ] = previous_lgbm_n_jobs
+
+        result_by_key = dict(
+            zip(unique_keys, unique_results)
+        )
+
+        # ログ・履歴は元のpopulation順で保存する。
+        for individual_index, chromosome in enumerate(
+            population,
+            start=1,
+        ):
+            key = tuple(int(x) for x in chromosome)
+            (
+                fitness,
+                auc_mean,
+                auc_std,
+            ) = result_by_key[key]
 
             fitnesses.append(fitness)
             auc_means.append(auc_mean)
@@ -930,6 +990,7 @@ def save_outer_fold_result(
     return output_path
 
 
+
 def is_outer_fold_complete(
     output_dir: Path,
     repeat_number: int,
@@ -937,18 +998,15 @@ def is_outer_fold_complete(
     fitness_lambda: float,
 ) -> tuple[bool, str]:
     """
-    outer_test_result.xlsx が正常に保存済みなら、
-    そのfoldは完了済みとみなす。
+    outer_test_result.xlsx が正常に保存済みなら、そのfoldは完了済みとみなす。
+
+    既存の実行結果にも使えるよう、専用チェックポイントファイルではなく
+    outer_test_result.xlsx 自体を検証する。
     """
-    result_path = (
-        output_dir / "outer_test_result.xlsx"
-    )
+    result_path = output_dir / "outer_test_result.xlsx"
 
     if not result_path.exists():
-        return (
-            False,
-            "outer_test_result.xlsx が存在しません",
-        )
+        return False, "outer_test_result.xlsx が存在しません"
 
     try:
         with pd.ExcelFile(
@@ -972,9 +1030,7 @@ def is_outer_fold_complete(
                 return (
                     False,
                     "必要なシートが不足しています: "
-                    + ", ".join(
-                        sorted(missing_sheets)
-                    ),
+                    + ", ".join(sorted(missing_sheets)),
                 )
 
             summary = pd.read_excel(
@@ -1002,27 +1058,17 @@ def is_outer_fold_complete(
             return (
                 False,
                 "summaryシートの必要列が不足しています: "
-                + ", ".join(
-                    sorted(missing_columns)
-                ),
+                + ", ".join(sorted(missing_columns)),
             )
 
         if summary.empty:
-            return (
-                False,
-                "summaryシートが空です",
-            )
+            return False, "summaryシートが空です"
 
         saved_repeat = int(
-            summary.iloc[0][
-                "outer_repeat"
-            ]
+            summary.iloc[0]["outer_repeat"]
         )
-
         saved_fold = int(
-            summary.iloc[0][
-                "outer_fold"
-            ]
+            summary.iloc[0]["outer_fold"]
         )
 
         if (
@@ -1036,9 +1082,7 @@ def is_outer_fold_complete(
             )
 
         saved_fitness_lambda = float(
-            summary.iloc[0][
-                "fitness_lambda"
-            ]
+            summary.iloc[0]["fitness_lambda"]
         )
 
         if not np.isclose(
@@ -1055,60 +1099,20 @@ def is_outer_fold_complete(
             )
 
         outer_test_auc = float(
-            summary.iloc[0][
-                "outer_test_auc"
-            ]
+            summary.iloc[0]["outer_test_auc"]
         )
 
-        if not np.isfinite(
-            outer_test_auc
-        ):
-            return (
-                False,
-                "outer_test_auc が有限値ではありません",
-            )
+        if not np.isfinite(outer_test_auc):
+            return False, "outer_test_auc が有限値ではありません"
 
     except Exception as exc:
         return (
             False,
-            "outer_test_result.xlsx を"
-            f"正常に読み込めません: {exc}",
+            f"outer_test_result.xlsx を正常に読み込めません: {exc}",
         )
 
-    return (
-        True,
-        "outer_test_result.xlsx 検証OK",
-    )
+    return True, "outer_test_result.xlsx 検証OK"
 
-
-def create_feature_selection_frequency(
-    feature_sets: pd.DataFrame,
-    all_features: list[str],
-    total_outer_splits: int,
-) -> pd.DataFrame:
-    counts = (
-        feature_sets["feature"]
-        .value_counts()
-        .reindex(all_features, fill_value=0)
-    )
-
-    result = pd.DataFrame({
-        "feature": all_features,
-        "selected_count": [
-            int(counts[feature])
-            for feature in all_features
-        ],
-    })
-
-    result["selection_rate"] = (
-        result["selected_count"]
-        / total_outer_splits
-    )
-
-    return result.sort_values(
-        ["selected_count", "feature"],
-        ascending=[False, True],
-    ).reset_index(drop=True)
 
 
 def run_genetic_algorithm_repeated_cv(
@@ -1128,6 +1132,7 @@ def run_genetic_algorithm_repeated_cv(
     output_path: str | Path | None = None,
     skip_threshold_cv: bool = False,
     fitness_lambda: float = 0.5,
+    thread_count: int = GA_THREAD_COUNT,
 ) -> Path:
     if data_path is None:
         X_all, y_all, config = filter_data(
@@ -1212,6 +1217,11 @@ def run_genetic_algorithm_repeated_cv(
             "fitness_lambda は0以上にしてください。"
         )
 
+    if thread_count < 1:
+        raise ValueError(
+            "thread_count は1以上にしてください。"
+        )
+
     experiment_name = config["experiment_name"]
 
     if output_path is None:
@@ -1254,6 +1264,7 @@ def run_genetic_algorithm_repeated_cv(
         "TEST約20%は特徴量決定後に1回だけ評価します。"
     )
     print(f"個体数: {population_size}")
+    print(f"GA個体評価スレッド数: {thread_count}")
     print(f"最大世代数: {generations}")
     print(
         "Fitness: mean(AUC) - "
@@ -1298,6 +1309,18 @@ def run_genetic_algorithm_repeated_cv(
             get_outer_repeat_and_fold(split_number)
         )
 
+        print(
+            "\n"
+            + "=" * 70
+        )
+        print(
+            f"[{current_timestamp()}] "
+            f"OUTER Repeat {repeat_number}/{OUTER_N_REPEATS}, "
+            f"Fold {fold_number}/{OUTER_N_SPLITS} "
+            f"({split_number}/{total_outer_splits})"
+        )
+        print("=" * 70)
+
         fold_output_dir = (
             output_dir
             / f"repeat_{repeat_number:02d}"
@@ -1316,47 +1339,29 @@ def run_genetic_algorithm_repeated_cv(
 
         if fold_is_complete:
             skipped_fold_count += 1
-
             print(
                 f"[{current_timestamp()}] "
                 "完了済みのためスキップ: "
-                f"Repeat {repeat_number}, "
-                f"Fold {fold_number}"
+                f"Repeat {repeat_number}, Fold {fold_number}"
             )
-
             print(
                 f"  判定: {completion_reason}"
             )
-
             continue
 
         if fold_output_dir.exists():
             print(
-                "  既存フォルダはありますが"
-                "未完了と判定したため、"
+                "  既存フォルダはありますが未完了と判定したため、"
                 "このfoldを最初から再実行します。"
             )
-
             print(
-                f"  判定理由: "
-                f"{completion_reason}"
+                f"  判定理由: {completion_reason}"
             )
 
         fold_output_dir.mkdir(
             parents=True,
             exist_ok=True,
         )
-        print(
-            "\n"
-            + "=" * 70
-        )
-        print(
-            f"[{current_timestamp()}] "
-            f"OUTER Repeat {repeat_number}/{OUTER_N_REPEATS}, "
-            f"Fold {fold_number}/{OUTER_N_SPLITS} "
-            f"({split_number}/{total_outer_splits})"
-        )
-        print("=" * 70)
 
         X_train = (
             X_all.iloc[train_indexes]
@@ -1412,6 +1417,7 @@ def run_genetic_algorithm_repeated_cv(
             random_seed=fold_ga_seed,
             skip_threshold_cv=skip_threshold_cv,
             fitness_lambda=fitness_lambda,
+            thread_count=thread_count,
         )
 
         (
@@ -1442,35 +1448,20 @@ def run_genetic_algorithm_repeated_cv(
             "outer_repeat",
             repeat_number,
         )
-
-        outer_result_path = (
-            save_outer_fold_result(
-                output_dir=fold_output_dir,
-                repeat_number=repeat_number,
-                fold_number=fold_number,
-                train_indexes=train_indexes,
-                test_indexes=test_indexes,
-                ga_cv_best_fitness=(
-                    ga_cv_best_fitness
-                ),
-                ga_cv_best_auc_mean=(
-                    ga_cv_best_auc_mean
-                ),
-                ga_cv_best_auc_std=(
-                    ga_cv_best_auc_std
-                ),
-                fitness_lambda=(
-                    fitness_lambda
-                ),
-                outer_test_auc=(
-                    outer_test_auc
-                ),
-                best_features=best_features,
-                predictions=predictions,
-                feature_importance=(
-                    feature_importance
-                ),
-            )
+        outer_result_path = save_outer_fold_result(
+            output_dir=fold_output_dir,
+            repeat_number=repeat_number,
+            fold_number=fold_number,
+            train_indexes=train_indexes,
+            test_indexes=test_indexes,
+            ga_cv_best_fitness=ga_cv_best_fitness,
+            ga_cv_best_auc_mean=ga_cv_best_auc_mean,
+            ga_cv_best_auc_std=ga_cv_best_auc_std,
+            fitness_lambda=fitness_lambda,
+            outer_test_auc=outer_test_auc,
+            best_features=best_features,
+            predictions=predictions,
+            feature_importance=feature_importance,
         )
 
         (
@@ -1490,6 +1481,7 @@ def run_genetic_algorithm_repeated_cv(
             )
 
         executed_fold_count += 1
+
         print("\n  ----- outer TEST評価 -----")
         print(
             "  GA選択個体 CV AUC: "
@@ -1509,32 +1501,24 @@ def run_genetic_algorithm_repeated_cv(
             f"  fold結果保存先: {outer_result_path}"
         )
 
-    # ↑ ここで for split_number ... のループが終了
-
     print("\n" + "=" * 70)
     print("===== 外側CV 実行終了 =====")
     print("=" * 70)
-
     print(
-        f"今回実行したfold: "
-        f"{executed_fold_count}"
+        f"今回実行したfold: {executed_fold_count}"
     )
-
     print(
-        f"完了済みでスキップしたfold: "
-        f"{skipped_fold_count}"
+        f"完了済みでスキップしたfold: {skipped_fold_count}"
     )
-
     print(
-        "outer_cv_summary.xlsx は"
-        "このプログラムでは作成しません。"
+        "outer_cv_summary.xlsx はこのプログラムでは作成しません。"
     )
-
     print(
         f"結果保存先: {output_dir}"
     )
 
     return output_dir
+
 
 
 
@@ -1662,6 +1646,16 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--threads",
+        type=int,
+        default=GA_THREAD_COUNT,
+        help=(
+            "GAのIndividual評価に使用するスレッド数。"
+            "デフォルト32"
+        ),
+    )
+
+    parser.add_argument(
         "--output",
         default=None,
         help="結果保存ディレクトリ",
@@ -1686,6 +1680,7 @@ def main() -> None:
         output_path=args.output,
         skip_threshold_cv=args.skip_threshold_cv,
         fitness_lambda=args.fitness_lambda,
+        thread_count=args.threads,
     )
 
 

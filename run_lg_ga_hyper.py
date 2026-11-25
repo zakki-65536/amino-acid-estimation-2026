@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import hashlib
 import json
 import random
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,7 +16,7 @@ from sklearn.model_selection import RepeatedStratifiedKFold
 from filter import filter_data
 from run_lightgbm import (
     DEFAULT_THRESHOLD,
-    evaluate_lightgbm,
+    RANDOM_STATE as LIGHTGBM_RANDOM_STATE,
     evaluate_lightgbm_holdout,
 )
 
@@ -33,7 +32,7 @@ OUTER_N_REPEATS = 10
 OUTER_RANDOM_STATE = 42
 
 INNER_N_SPLITS = 5
-INNER_N_REPEATS = 1
+INNER_N_REPEATS = 3
 
 POPULATION_SIZE = 40
 GENERATIONS = 200
@@ -43,7 +42,7 @@ CROSSOVER_RATE = 0.8
 ELITE_SIZE = 2
 TOURNAMENT_SIZE = 3
 
-GA_THREAD_COUNT = 32
+GA_PROCESS_COUNT = 32
 RANDOM_SEED = 42
 
 # ============================================================
@@ -442,33 +441,6 @@ def initialize_population(
     return population
 
 
-def get_auc_mean_std(
-    evaluation: dict,
-) -> tuple[float, float]:
-    summary_metrics = evaluation[
-        "result_sheets"
-    ]["summary_metrics"]
-
-    auc_row = summary_metrics[
-        summary_metrics["metric"]
-        == "roc_auc"
-    ]
-
-    if auc_row.empty:
-        raise ValueError(
-            "summary_metrics に roc_auc がありません。"
-        )
-
-    auc_mean = float(
-        auc_row.iloc[0]["mean"]
-    )
-    auc_std = float(
-        auc_row.iloc[0]["std"]
-    )
-
-    return auc_mean, auc_std
-
-
 def build_individual_model_params(
     individual: Individual,
     model_random_state: int,
@@ -476,7 +448,8 @@ def build_individual_model_params(
     """
     個体のパラメータ遺伝子を LightGBM の設定へ変換する。
 
-    GAはIndividualを並列評価するため、LightGBM側はn_jobs=1に固定する。
+    GA内部では Individual × CV split を並列評価するため、
+    各LightGBMはn_jobs=1に固定する。
     run_lightgbm.py のグローバル MODEL_PARAMS は変更しない。
     """
     return {
@@ -491,17 +464,57 @@ def build_individual_model_params(
     }
 
 
-def evaluate_individual(
+def create_inner_cv_splits(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    inner_n_splits: int,
+    inner_n_repeats: int,
+) -> list[
+    tuple[np.ndarray, np.ndarray]
+]:
+    """
+    run_lightgbm.py の evaluate_lightgbm() と同じ
+    RepeatedStratifiedKFold条件でsplitを一度だけ作る。
+
+    全Individualが同じsplitを使うので、
+    Individual間のFitness比較条件も揃う。
+    """
+    splitter = RepeatedStratifiedKFold(
+        n_splits=inner_n_splits,
+        n_repeats=inner_n_repeats,
+        random_state=LIGHTGBM_RANDOM_STATE,
+    )
+
+    return [
+        (
+            train_indexes,
+            test_indexes,
+        )
+        for (
+            train_indexes,
+            test_indexes,
+        ) in splitter.split(
+            X_train,
+            y_train,
+        )
+    ]
+
+
+def evaluate_individual_cv_split(
     individual: Individual,
     all_features: list[str],
     X_train: pd.DataFrame,
     y_train: pd.Series,
-    config: dict,
-    inner_n_splits: int,
-    inner_n_repeats: int,
-    fitness_lambda: float,
+    train_indexes: np.ndarray,
+    test_indexes: np.ndarray,
     model_random_state: int,
-) -> EvaluationResult:
+) -> float:
+    """
+    1 Individual × 1 inner-CV split のLightGBMを1回だけ学習し、
+    AUCを返す。
+
+    この関数1回 = ProcessPoolExecutorへ投入する1ジョブ。
+    """
     selected_features = (
         selected_features_from_mask(
             individual.feature_mask,
@@ -510,22 +523,9 @@ def evaluate_individual(
     )
 
     if not selected_features:
-        return EvaluationResult(
-            fitness=float("-inf"),
-            auc_mean=float("nan"),
-            auc_std=float("nan"),
+        raise ValueError(
+            "選択特徴量が0個です。"
         )
-
-    current_config = copy.deepcopy(
-        config
-    )
-    current_config["features"] = (
-        selected_features.copy()
-    )
-
-    X_current = X_train[
-        selected_features
-    ].copy()
 
     model_params = (
         build_individual_model_params(
@@ -536,54 +536,206 @@ def evaluate_individual(
         )
     )
 
+    evaluation = evaluate_lightgbm_holdout(
+        X_train_original=(
+            X_train.iloc[
+                train_indexes
+            ][selected_features]
+            .copy()
+        ),
+        y_train=(
+            y_train.iloc[
+                train_indexes
+            ]
+            .copy()
+        ),
+        X_test_original=(
+            X_train.iloc[
+                test_indexes
+            ][selected_features]
+            .copy()
+        ),
+        y_test=(
+            y_train.iloc[
+                test_indexes
+            ]
+            .copy()
+        ),
+        default_threshold=(
+            DEFAULT_THRESHOLD
+        ),
+        model_params=model_params,
+        return_details=False,
+    )
+
+    auc = float(
+        evaluation["roc_auc"]
+    )
+
+    if not np.isfinite(auc):
+        raise ValueError(
+            "AUCが有限値ではありません。"
+        )
+
+    return auc
+
+
+
+# ============================================================
+# ProcessPool worker state
+# ============================================================
+# outer TRAINのデータを各fitジョブのたびにpickleしないよう、
+# ProcessPoolExecutorのinitializerで各ワーカーに1回だけ保持する。
+_PROCESS_X_TRAIN: pd.DataFrame | None = None
+_PROCESS_Y_TRAIN: pd.Series | None = None
+_PROCESS_ALL_FEATURES: list[str] | None = None
+_PROCESS_INDIVIDUALS: dict[\
+    tuple[tuple[int, ...], tuple[int, ...]],\
+    Individual\
+] | None = None
+_PROCESS_INNER_SPLITS: list[\
+    tuple[np.ndarray, np.ndarray]\
+] | None = None
+_PROCESS_RANDOM_SEED: int | None = None
+
+
+def initialize_fit_worker(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+    all_features: list[str],
+    individuals: dict[
+        tuple[tuple[int, ...], tuple[int, ...]],
+        Individual,
+    ],
+    inner_splits: list[
+        tuple[np.ndarray, np.ndarray]
+    ],
+    random_seed: int,
+) -> None:
+    """ProcessPoolの各ワーカーを1回だけ初期化する。"""
+    global _PROCESS_X_TRAIN
+    global _PROCESS_Y_TRAIN
+    global _PROCESS_ALL_FEATURES
+    global _PROCESS_INDIVIDUALS
+    global _PROCESS_INNER_SPLITS
+    global _PROCESS_RANDOM_SEED
+
+    _PROCESS_X_TRAIN = X_train
+    _PROCESS_Y_TRAIN = y_train
+    _PROCESS_ALL_FEATURES = all_features
+    _PROCESS_INDIVIDUALS = individuals
+    _PROCESS_INNER_SPLITS = inner_splits
+    _PROCESS_RANDOM_SEED = random_seed
+
+
+def evaluate_fit_job_process(
+    job: tuple[
+        tuple[tuple[int, ...], tuple[int, ...]],
+        int,
+    ],
+) -> tuple[
+    tuple[tuple[int, ...], tuple[int, ...]],
+    int,
+    float,
+    str | None,
+]:
+    """
+    1 Individual × 1 inner-CV split を子プロセスで評価する。
+
+    ジョブにはkeyとsplit番号だけを渡し、DataFrame等は
+    initializerで各ワーカーに保持したものを使う。
+    """
+    key, split_index = job
+
+    if (
+        _PROCESS_X_TRAIN is None
+        or _PROCESS_Y_TRAIN is None
+        or _PROCESS_ALL_FEATURES is None
+        or _PROCESS_INDIVIDUALS is None
+        or _PROCESS_INNER_SPLITS is None
+        or _PROCESS_RANDOM_SEED is None
+    ):
+        return (
+            key,
+            split_index,
+            float("nan"),
+            "ProcessPool workerが初期化されていません。",
+        )
+
+    individual = _PROCESS_INDIVIDUALS[key]
+    train_indexes, test_indexes = _PROCESS_INNER_SPLITS[split_index]
+
     try:
-        evaluation = evaluate_lightgbm(
-            X_original=X_current,
-            y=y_train,
-            config=current_config,
-            # FitnessはAUCのみなので閾値探索は常に省略する。
-            skip_threshold_cv=True,
-            default_threshold=(
-                DEFAULT_THRESHOLD
-            ),
-            n_splits=inner_n_splits,
-            n_repeats=inner_n_repeats,
-            model_params=model_params,
+        auc = evaluate_individual_cv_split(
+            individual=individual,
+            all_features=_PROCESS_ALL_FEATURES,
+            X_train=_PROCESS_X_TRAIN,
+            y_train=_PROCESS_Y_TRAIN,
+            train_indexes=train_indexes,
+            test_indexes=test_indexes,
+            model_random_state=_PROCESS_RANDOM_SEED,
         )
 
-        auc_mean, auc_std = (
-            get_auc_mean_std(
-                evaluation
-            )
-        )
-
-        if (
-            not np.isfinite(auc_mean)
-            or not np.isfinite(auc_std)
-        ):
-            raise ValueError(
-                "AUCの平均または標準偏差が有限値ではありません。"
-            )
-
-        fitness = float(
-            auc_mean
-            - fitness_lambda
-            * auc_std
+        return (
+            key,
+            split_index,
+            auc,
+            None,
         )
 
     except Exception as exc:
-        print(
-            "    個体評価失敗: "
-            f"features="
-            f"{len(selected_features)} / "
-            f"{exc}"
+        return (
+            key,
+            split_index,
+            float("nan"),
+            str(exc),
         )
 
+def aggregate_split_aucs(
+    auc_values: list[float],
+    fitness_lambda: float,
+) -> EvaluationResult:
+    """
+    run_lightgbm.py の summary_metrics と同じく、
+    fold AUCの平均と標本標準偏差(ddof=1)からFitnessを計算する。
+    """
+    values = np.asarray(
+        auc_values,
+        dtype=float,
+    )
+
+    if (
+        len(values) == 0
+        or not np.all(
+            np.isfinite(values)
+        )
+    ):
         return EvaluationResult(
             fitness=float("-inf"),
             auc_mean=float("nan"),
             auc_std=float("nan"),
         )
+
+    auc_mean = float(
+        np.mean(values)
+    )
+
+    auc_std = (
+        float(
+            np.std(
+                values,
+                ddof=1,
+            )
+        )
+        if len(values) >= 2
+        else 0.0
+    )
+
+    fitness = float(
+        auc_mean
+        - fitness_lambda
+        * auc_std
+    )
 
     return EvaluationResult(
         fitness=fitness,
@@ -1090,7 +1242,7 @@ def run_ga_on_outer_train(
     inner_n_splits: int,
     inner_n_repeats: int,
     random_seed: int,
-    thread_count: int,
+    process_count: int,
 ) -> tuple[
     Individual,
     EvaluationResult,
@@ -1105,6 +1257,23 @@ def run_ga_on_outer_train(
 
     rng = np.random.default_rng(
         random_seed
+    )
+
+    # inner CV splitはouter TRAINごとに一度だけ作り、
+    # 全Individualで共通利用する。
+    inner_splits = create_inner_cv_splits(
+        X_train=X_train,
+        y_train=y_train,
+        inner_n_splits=(
+            inner_n_splits
+        ),
+        inner_n_repeats=(
+            inner_n_repeats
+        ),
+    )
+
+    inner_split_count = len(
+        inner_splits
     )
 
     population = initialize_population(
@@ -1195,70 +1364,182 @@ def run_ga_on_outer_train(
             f"{len(keys_to_evaluate)}"
         )
 
-        def evaluate_key(
-            key: tuple[
-                tuple[int, ...],
-                tuple[int, ...],
-            ],
-        ) -> tuple[
-            tuple[
-                tuple[int, ...],
-                tuple[int, ...],
-            ],
-            EvaluationResult,
-        ]:
-            individual = (
-                unique_individuals[
-                    key
-                ]
-            )
+        # ----------------------------------------------------
+        # 並列化単位:
+        #   Individual × inner-CV split
+        #
+        # 例:
+        #   40個体 × (5-fold × 3 repeats)
+        #   = 最大600 fitジョブ
+        #
+        # --processes 32 の場合は、その600ジョブのうち
+        # 最大32個のLightGBM fitプロセスが同時に走る。
+        # ----------------------------------------------------
+        new_fit_job_count = (
+            len(keys_to_evaluate)
+            * inner_split_count
+        )
 
-            evaluation = (
-                evaluate_individual(
-                    individual=(
-                        individual
-                    ),
-                    all_features=(
-                        all_features
-                    ),
-                    X_train=X_train,
-                    y_train=y_train,
-                    config=config,
-                    inner_n_splits=(
-                        inner_n_splits
-                    ),
-                    inner_n_repeats=(
-                        inner_n_repeats
+        print(
+            "  inner CV split数/個体: "
+            f"{inner_split_count} / "
+            "新規fitジョブ数: "
+            f"{new_fit_job_count} / "
+            "最大同時fit数: "
+            f"{min(process_count, new_fit_job_count)}"
+        )
+
+        if keys_to_evaluate:
+            auc_values_by_key: dict[
+                tuple[
+                    tuple[int, ...],
+                    tuple[int, ...],
+                ],
+                list[float],
+            ] = {
+                key: [
+                    float("nan")
+                ] * inner_split_count
+                for key
+                in keys_to_evaluate
+            }
+
+            errors_by_key: dict[
+                tuple[
+                    tuple[int, ...],
+                    tuple[int, ...],
+                ],
+                list[str],
+            ] = {
+                key: []
+                for key
+                in keys_to_evaluate
+            }
+
+            fit_jobs: list[
+                tuple[
+                    tuple[
+                        tuple[int, ...],
+                        tuple[int, ...],
+                    ],
+                    int,
+                ]
+            ] = [
+                (
+                    key,
+                    split_index,
+                )
+                for key in keys_to_evaluate
+                for split_index in range(
+                    inner_split_count
+                )
+            ]
+
+            # CPU-boundなLightGBM fitはプロセス並列で実行する。
+            # X_train / y_train / Individual辞書 / CV splitは
+            # initializerで各ワーカーへ1回だけ渡すため、
+            # 600ジョブそれぞれにDataFrame全体を送らない。
+            with ProcessPoolExecutor(
+                max_workers=process_count,
+                initializer=initialize_fit_worker,
+                initargs=(
+                    X_train,
+                    y_train,
+                    all_features,
+                    {
+                        key: unique_individuals[key]
+                        for key in keys_to_evaluate
+                    },
+                    inner_splits,
+                    random_seed,
+                ),
+            ) as executor:
+                for (
+                    key,
+                    split_index,
+                    auc,
+                    error,
+                ) in executor.map(
+                    evaluate_fit_job_process,
+                    fit_jobs,
+                    chunksize=1,
+                ):
+                    auc_values_by_key[
+                        key
+                    ][
+                        split_index
+                    ] = auc
+
+                    if error is not None:
+                        errors_by_key[
+                            key
+                        ].append(
+                            (
+                                f"split "
+                                f"{split_index + 1}: "
+                                f"{error}"
+                            )
+                        )
+
+            for key in keys_to_evaluate:
+                errors = (
+                    errors_by_key[
+                        key
+                    ]
+                )
+
+                if errors:
+                    individual = (
+                        unique_individuals[
+                            key
+                        ]
+                    )
+
+                    selected_features = (
+                        selected_features_from_mask(
+                            individual.feature_mask,
+                            all_features,
+                        )
+                    )
+
+                    print(
+                        "    個体評価失敗: "
+                        f"features="
+                        f"{len(selected_features)} / "
+                        f"失敗split="
+                        f"{len(errors)}/"
+                        f"{inner_split_count} / "
+                        f"{errors[0]}"
+                    )
+
+                    evaluation_cache[
+                        key
+                    ] = EvaluationResult(
+                        fitness=(
+                            float("-inf")
+                        ),
+                        auc_mean=(
+                            float("nan")
+                        ),
+                        auc_std=(
+                            float("nan")
+                        ),
+                    )
+
+                    continue
+
+                evaluation_cache[
+                    key
+                ] = aggregate_split_aucs(
+                    auc_values=(
+                        auc_values_by_key[
+                            key
+                        ]
                     ),
                     fitness_lambda=(
                         fitness_lambda
                     ),
-                    model_random_state=(
-                        random_seed
-                    ),
                 )
-            )
-
-            return (
-                key,
-                evaluation,
-            )
-
-        if keys_to_evaluate:
-            with ThreadPoolExecutor(
-                max_workers=(
-                    thread_count
-                )
-            ) as executor:
-                for key, evaluation in (
-                    executor.map(
-                        evaluate_key,
-                        keys_to_evaluate,
-                    )
-                ):
-                    evaluation_cache[
-                        key
-                    ] = evaluation
 
         evaluations = [
             evaluation_cache[
@@ -2182,7 +2463,7 @@ def run_genetic_algorithm(
     outer_n_repeats: int = OUTER_N_REPEATS,
     random_seed: int = RANDOM_SEED,
     outer_random_state: int = OUTER_RANDOM_STATE,
-    thread_count: int = GA_THREAD_COUNT,
+    process_count: int = GA_PROCESS_COUNT,
     output_path: str | Path | None = None,
 ) -> Path:
     if data_path is None:
@@ -2311,9 +2592,9 @@ def run_genetic_algorithm(
             "1以上にしてください。"
         )
 
-    if thread_count < 1:
+    if process_count < 1:
         raise ValueError(
-            "threadsは"
+            "processesは"
             "1以上にしてください。"
         )
 
@@ -2538,8 +2819,13 @@ def run_genetic_algorithm(
         f"{tournament_size}"
     )
     print(
-        f"並列スレッド数: "
-        f"{thread_count}"
+        f"並列プロセス数: "
+        f"{process_count}"
+    )
+    print(
+        "並列化単位: "
+        "Individual × inner-CV split "
+        "(ProcessPool: 1ジョブ = LightGBM 1 fit)"
     )
     print(
         f"出力先: "
@@ -2751,8 +3037,8 @@ def run_genetic_algorithm(
             random_seed=(
                 fold_ga_seed
             ),
-            thread_count=(
-                thread_count
+            process_count=(
+                process_count
             ),
         )
 
@@ -3177,14 +3463,16 @@ def main() -> None:
     )
 
     parser.add_argument(
+        "--processes",
         "--threads",
+        dest="processes",
         type=int,
-        default=GA_THREAD_COUNT,
+        default=GA_PROCESS_COUNT,
         help=(
-            "個体並列評価の"
-            "最大スレッド数 "
-            f"(default: "
-            f"{GA_THREAD_COUNT})"
+            "Individual×inner-CV split単位の"
+            "LightGBM fit最大並列プロセス数。"
+            "--threads は旧版互換の別名 "
+            f"(default: {GA_PROCESS_COUNT})"
         ),
     )
 
@@ -3241,8 +3529,8 @@ def main() -> None:
         outer_random_state=(
             args.outer_seed
         ),
-        thread_count=(
-            args.threads
+        process_count=(
+            args.processes
         ),
         output_path=args.output,
     )

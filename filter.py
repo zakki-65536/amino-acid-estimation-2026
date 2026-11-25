@@ -213,8 +213,46 @@ def apply_missing_feature_filter(
       "0以上1以下で指定してください。"
     )
 
+  filter_feature_ids_config = filter_config.get(
+    "features"
+  )
+
+  if filter_feature_ids_config is None:
+    missing_feature_ids = feature_ids
+  else:
+    if (
+      not isinstance(
+        filter_feature_ids_config,
+        list
+      )
+      or len(filter_feature_ids_config) == 0
+    ):
+      raise ValueError(
+        "missing_feature_filter.featuresには"
+        "1項目以上のリストを指定してください。"
+      )
+
+    missing_feature_ids = [
+      normalize_item_id(item_id)
+      for item_id in filter_feature_ids_config
+    ]
+
+    unknown_feature_ids = [
+      item_id
+      for item_id in missing_feature_ids
+      if item_id not in feature_ids
+    ]
+
+    if unknown_feature_ids:
+      raise ValueError(
+        "missing_feature_filter.featuresには、"
+        "config.featuresに含まれる項目のみ"
+        "指定してください。"
+        f" 未登録項目: {unknown_feature_ids}"
+      )
+
   missing_ratios = (
-    data[feature_ids]
+    data[missing_feature_ids]
     .isna()
     .mean(axis=1)
   )
@@ -320,9 +358,23 @@ def main() -> None:
   if missing_filter is None:
     print("欠損率フィルタ: なし")
   else:
+    missing_filter_features = (
+      missing_filter.get("features")
+    )
+
+    if missing_filter_features is None:
+      feature_description = "全features"
+    else:
+      feature_description = (
+        "指定features="
+        f"{missing_filter_features}"
+      )
+
     print(
       "欠損率フィルタ: "
-      f"(欠損率) {missing_filter.get('operator')} {missing_filter.get('ratio')}"
+      f"(欠損率) {missing_filter.get('operator')} "
+      f"{missing_filter.get('ratio')} / "
+      f"{feature_description}"
     )
 
   target_config = config["target"]

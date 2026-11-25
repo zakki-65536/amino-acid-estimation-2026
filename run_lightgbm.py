@@ -905,7 +905,8 @@ def evaluate_lightgbm_holdout(
   X_test_original: pd.DataFrame,
   y_test: pd.Series,
   default_threshold: float = DEFAULT_THRESHOLD,
-  model_params: dict | None = None
+  model_params: dict | None = None,
+  return_details: bool = True
 ) -> dict:
   """
   学習データ全体でLightGBMを1回学習し、
@@ -967,6 +968,13 @@ def evaluate_lightgbm_holdout(
       positive_probabilities
     )
   )
+
+  # GA内部CVではAUCだけが必要なので、
+  # 不要なpredictions / feature_importance生成を省略できる。
+  if not return_details:
+    return {
+      "roc_auc": roc_auc,
+    }
 
   predictions = pd.DataFrame({
     "actual": y_test.to_numpy(),
